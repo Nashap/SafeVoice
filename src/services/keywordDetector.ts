@@ -7,23 +7,33 @@ export interface KeywordDetectionResult {
 }
 
 export const detectKeywords = (text: string): KeywordDetectionResult => {
-  const normalizedText = normalizeText(text);
-  const matchedKeywords: Set<string> = new Set();
+  let normalizedText = normalizeText(text);
+  const matchedKeywords: string[] = [];
   
   if (!normalizedText) {
     return { matchedKeywords: [], count: 0 };
   }
 
-  // Iterate over predefined emergency keywords
-  EMERGENCY_KEYWORDS.forEach(keyword => {
-    // If the normalized text includes the keyword, add it to the matched set
-    if (normalizedText.includes(keyword)) {
-      matchedKeywords.add(keyword);
+  // Sort keywords by length descending so longer phrases match first
+  const sortedKeywords = [...EMERGENCY_KEYWORDS].sort((a, b) => b.length - a.length);
+
+  for (const keyword of sortedKeywords) {
+    let index = normalizedText.indexOf(keyword);
+    while (index !== -1) {
+      matchedKeywords.push(keyword);
+      console.log(`[KEYWORD_DEBUG] matched phrase: "${keyword}"`);
+      
+      // Mask this occurrence to prevent double counting of sub-phrases (e.g., "help" inside "help me")
+      const masked = '*'.repeat(keyword.length);
+      normalizedText = normalizedText.substring(0, index) + masked + normalizedText.substring(index + keyword.length);
+      
+      // Search for next occurrence
+      index = normalizedText.indexOf(keyword, index + masked.length);
     }
-  });
+  }
 
   return {
-    matchedKeywords: Array.from(matchedKeywords),
-    count: matchedKeywords.size
+    matchedKeywords,
+    count: matchedKeywords.length
   };
 };

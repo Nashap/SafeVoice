@@ -1,7 +1,7 @@
 import Vosk from 'react-native-vosk';
 import { loadModel, start, stop, unload, onPartialResult, onResult, onError } from 'react-native-vosk';
 import { detectKeywords, KeywordDetectionResult } from './keywordDetector';
-import { Alert, EventSubscription } from 'react-native';
+import { Alert, EventSubscription, DeviceEventEmitter } from 'react-native';
 
 class VoskService {
   private isLoaded: boolean = false;
@@ -11,6 +11,7 @@ class VoskService {
   public onPartialText?: (text: string) => void;
   public onFinalText?: (text: string, detectionResult: KeywordDetectionResult) => void;
   public onVoskError?: (error: string) => void;
+  public onRmsValue?: (rms: number) => void;
   public onStateChange?: (state: 'loading' | 'ready' | 'listening' | 'error' | 'stopped') => void;
 
   private currentK: number = 0;
@@ -18,6 +19,10 @@ class VoskService {
   private partialSub?: EventSubscription;
   private resultSub?: EventSubscription;
   private errorSub?: EventSubscription;
+  private rmsSub?: EventSubscription;
+  
+  private lastProcessedResultText: string = "";
+  private lastProcessedResultTime: number = 0;
 
   async initialize() {
     if (this.isLoaded) return;
@@ -37,39 +42,69 @@ class VoskService {
   }
 
   private setupListeners() {
-    // Clear old subscriptions if they exist
     this.partialSub?.remove();
     this.resultSub?.remove();
     this.errorSub?.remove();
+    this.rmsSub?.remove();
+
+    this.rmsSub = DeviceEventEmitter.addListener('onRms', (rmsStr: string) => {
+      const rms = parseFloat(rmsStr);
+      if (!isNaN(rms)) {
+        console.log(`[RMS] value: ${rms.toFixed(2)}`);
+        this.onRmsValue?.(rms);
+      }
+    });
 
     this.partialSub = onPartialResult((res: string) => {
+      console.log('[VOSK_RAW_PARTIAL]', res);
       try {
         const parsed = typeof res === 'string' ? JSON.parse(res) : res;
         const text = parsed.partial !== undefined ? parsed.partial : (parsed as string);
-        if (text) {
-          this.onPartialText?.(text);
-        }
+        this.onPartialText?.(text || "<silence>");
       } catch (e) {
-        if (typeof res === 'string' && res.trim()) {
-           this.onPartialText?.(res);
+        if (typeof res === 'string') {
+           this.onPartialText?.(res || "<silence>");
         }
       }
     });
 
     this.resultSub = onResult((res: string) => {
+      // console.log('[VOSK_RESULT]', res);
       try {
         const parsed = typeof res === 'string' ? JSON.parse(res) : res;
         const text = parsed.text !== undefined ? parsed.text : (parsed as string);
         if (text) {
+          // Prevent exact duplicate events fired by the bridge within 500ms
+          const now = Date.now();
+          if (text === this.lastProcessedResultText && now - this.lastProcessedResultTime < 500) {
+            return;
+          }
+          this.lastProcessedResultText = text;
+          this.lastProcessedResultTime = now;
+
+          console.log(`[KEYWORD_DEBUG] final utterance: "${text}"`);
           const detection = detectKeywords(text);
           if (detection.count > 0) {
             this.currentK += detection.count;
+            console.log(`[KEYWORD_DEBUG] incrementing K: ${detection.count} (Total K = ${this.currentK})`);
           }
           this.onFinalText?.(text, detection);
         }
       } catch (e) {
         if (typeof res === 'string' && res.trim()) {
+          const now = Date.now();
+          if (res === this.lastProcessedResultText && now - this.lastProcessedResultTime < 500) {
+            return;
+          }
+          this.lastProcessedResultText = res;
+          this.lastProcessedResultTime = now;
+          
+          console.log(`[KEYWORD_DEBUG] final utterance: "${res}"`);
           const detection = detectKeywords(res);
+          if (detection.count > 0) {
+            this.currentK += detection.count;
+            console.log(`[KEYWORD_DEBUG] incrementing K: ${detection.count} (Total K = ${this.currentK})`);
+          }
           this.onFinalText?.(res, detection);
         }
       }
@@ -84,6 +119,7 @@ class VoskService {
   }
 
   async startListening() {
+    console.log('[MIC_LIFECYCLE] voskService.startListening() called');
     if (!this.isLoaded) {
       await this.initialize();
     }
@@ -103,6 +139,7 @@ class VoskService {
   }
 
   async stopListening() {
+    console.log('[MIC_LIFECYCLE] voskService.stopListening() called');
     if (!this.isListening) return;
 
     try {
@@ -115,10 +152,12 @@ class VoskService {
   }
 
   unloadService() {
+    console.log('[MIC_LIFECYCLE] voskService.unloadService() called');
     try {
       this.partialSub?.remove();
       this.resultSub?.remove();
       this.errorSub?.remove();
+      this.rmsSub?.remove();
       unload();
       this.isLoaded = false;
       this.isListening = false;

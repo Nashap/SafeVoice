@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TextInput, Alert } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, TextInput, Alert } from 'react-native';
 import Header from '../components/Header';
 import Button from '../components/Button';
 import Card from '../components/Card';
@@ -7,7 +7,10 @@ import { Colors } from '../theme/colors';
 import { Typography } from '../theme/typography';
 import { useSafeVoice } from '../context/SafeVoiceContext';
 
+import { useAuth } from '../context/AuthContext';
+
 export default function ProfileScreen() {
+  const { logout, username, isAuthenticated } = useAuth();
   const { profile, setProfile, isLoaded } = useSafeVoice();
   const [isEditing, setIsEditing] = useState(false);
   const [name, setName] = useState(profile.name);
@@ -40,6 +43,40 @@ export default function ProfileScreen() {
     setIsEditing(false);
     Alert.alert('Success', 'Profile saved successfully.');
   };
+
+  const handleLogout = () => {
+    Alert.alert(
+      'Log Out',
+      'Are you sure you want to log out?',
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'Log Out',
+          style: 'destructive',
+          onPress: async () => {
+            await logout();
+          },
+        },
+      ]
+    );
+  };
+
+  if (isAuthenticated && !username) {
+    return (
+      <View style={styles.container}>
+        <Header title="My Profile" />
+        <View style={styles.content}>
+          <Text style={{ color: 'red', textAlign: 'center', marginBottom: 20 }}>
+            Failed to load account details from the server. Please check your connection and log in again.
+          </Text>
+          <Button title="Log Out" onPress={handleLogout} />
+        </View>
+      </View>
+    );
+  }
 
   if (!isLoaded) {
     return (
@@ -101,6 +138,13 @@ export default function ProfileScreen() {
                 onPress={() => setIsEditing(true)}
                 style={styles.editBtn}
               />
+              <View style={styles.btnSpacerVertical} />
+              <Button 
+                title="Log Out"
+                onPress={handleLogout}
+                variant="secondary"
+                style={styles.logoutBtn}
+              />
             </View>
           )}
         </Card>
@@ -151,6 +195,9 @@ const styles = StyleSheet.create({
   editBtn: {
     width: '100%',
   },
+  logoutBtn: {
+    width: '100%',
+  },
   form: {
     width: '100%',
   },
@@ -177,6 +224,9 @@ const styles = StyleSheet.create({
   btnSpacer: {
     width: 16,
   },
+  btnSpacerVertical: {
+    height: 16,
+  },
   emptyStateText: {
     ...Typography.body2,
     color: Colors.warning,
@@ -190,3 +240,4 @@ const styles = StyleSheet.create({
     color: Colors.textSecondary,
   }
 });
+

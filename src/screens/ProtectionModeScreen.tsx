@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { View, Text, StyleSheet, PermissionsAndroid, Platform, Alert, ScrollView } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import Header from '../components/Header';
@@ -6,48 +6,25 @@ import Button from '../components/Button';
 import { Colors } from '../theme/colors';
 import { Typography } from '../theme/typography';
 import { useSafeVoice } from '../context/SafeVoiceContext';
-import { voskService } from '../services/voskService';
 
 export default function ProtectionModeScreen() {
-  const navigation = useNavigation();
-  const { isProtectionActive, setProtectionActive } = useSafeVoice();
-  
-  const [voskState, setVoskState] = useState<string>('stopped');
-  const [recognizedText, setRecognizedText] = useState<string>('');
-  const [detectedKeywords, setDetectedKeywords] = useState<string[]>([]);
-  const [keywordCount, setKeywordCount] = useState<number>(0);
-
-  useEffect(() => {
-    // Setup Vosk UI callbacks
-    voskService.onStateChange = setVoskState;
-    
-    voskService.onPartialText = (text) => {
-      setRecognizedText(text);
-    };
-    
-    voskService.onFinalText = (text, detection) => {
-      setRecognizedText(text);
-      if (detection.count > 0) {
-        setDetectedKeywords(detection.matchedKeywords);
-        setKeywordCount(prev => prev + detection.count);
-      }
-    };
-    
-    voskService.onVoskError = (e) => {
-      Alert.alert('Voice Recognition Error', e);
-      setProtectionActive(false);
-    };
-
-    return () => {
-      // If we leave the screen but protection is active, it stays active in the background context
-      // but in a real app you might need a foreground service. For now, we stop it if unmounting
-      // unless we want it to run globally. We'll stop it on unmount for this phase testing.
-      if (isProtectionActive) {
-        setProtectionActive(false);
-        voskService.stopListening();
-      }
-    };
-  }, [isProtectionActive, setProtectionActive]);
+  const navigation = useNavigation<any>();
+  const { 
+    isProtectionActive, 
+    voskState,
+    recognizedText,
+    detectedKeywords,
+    keywordCount,
+    repetitionFactor,
+    rms,
+    emergencyScore,
+    countdown,
+    decision,
+    startProtectionMode,
+    stopProtectionMode,
+    cancelEmergency,
+    location
+  } = useSafeVoice();
 
   const requestMicrophonePermission = async () => {
     if (Platform.OS === 'android') {
@@ -56,7 +33,7 @@ export default function ProtectionModeScreen() {
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
           {
             title: 'Microphone Permission',
-            message: 'SafeVoice needs access to your microphone to listen for emergency keywords offline.',
+            message: 'SafeVoice needs access to your microphone for emergency voice monitoring.',
             buttonNeutral: 'Ask Me Later',
             buttonNegative: 'Cancel',
             buttonPositive: 'OK',
@@ -73,22 +50,14 @@ export default function ProtectionModeScreen() {
 
   const handleToggle = async () => {
     if (isProtectionActive) {
-      setProtectionActive(false);
-      await voskService.stopListening();
+      await stopProtectionMode();
     } else {
       const hasPermission = await requestMicrophonePermission();
       if (!hasPermission) {
-        Alert.alert('Permission Denied', 'Microphone permission is required for offline speech recognition.');
+        Alert.alert('Permission Denied', 'Microphone permission is required.');
         return;
       }
-      
-      // Reset state for new session
-      setKeywordCount(0);
-      setDetectedKeywords([]);
-      setRecognizedText('');
-      
-      setProtectionActive(true);
-      await voskService.startListening();
+      await startProtectionMode();
     }
   };
 
@@ -96,6 +65,35 @@ export default function ProtectionModeScreen() {
     <View style={styles.container}>
       <Header title="Protection Mode" />
       <ScrollView contentContainerStyle={styles.content}>
+        
+        {countdown !== null && decision === 'Potential Emergency' && (
+          <View style={styles.alertBox}>
+            <Text style={styles.alertTitle}>POTENTIAL EMERGENCY DETECTED</Text>
+            <Text style={styles.alertText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
+            <Text style={styles.alertText}>Emergency response will begin in:</Text>
+            <Text style={styles.countdownText}>{countdown}</Text>
+            <Button title="CANCEL EMERGENCY" onPress={cancelEmergency} variant="danger" />
+          </View>
+        )}
+        
+        {decision === 'Confirmed' && (
+          <View style={styles.alertBox}>
+            <Text style={styles.alertTitle}>EMERGENCY CONFIRMED</Text>
+            <Text style={styles.alertText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
+            <Text style={styles.alertText}>Emergency response would now begin.</Text>
+            {location === 'error' ? (
+              <Text style={styles.alertText}>
+                Location: Unable to retrieve location
+              </Text>
+            ) : location !== null ? (
+              <Text style={styles.alertText}>
+                Location: {location.latitude.toFixed(4)}, {location.longitude.toFixed(4)}
+              </Text>
+            ) : null}
+            <Button title="RESET" onPress={cancelEmergency} variant="secondary" />
+          </View>
+        )}
+
         <View style={styles.statusContainer}>
           <View style={[styles.indicator, { backgroundColor: isProtectionActive ? Colors.success : Colors.error }]} />
           <Text style={styles.statusText}>
@@ -109,7 +107,7 @@ export default function ProtectionModeScreen() {
         </View>
         
         <Text style={styles.description}>
-          Voice recognition runs locally on this device. When active, SafeVoice listens for emergency keywords without requiring an internet connection.
+          Emergency voice monitoring is running in the background. It will continue running even if you navigate away or minimize the app.
         </Text>
 
         {isProtectionActive && (
@@ -127,6 +125,19 @@ export default function ProtectionModeScreen() {
             <Text style={styles.keywordCount}>
               Keyword Count: K = {keywordCount}
             </Text>
+            <Text style={styles.keywordCount}>
+              Repetition Factor: M = {repetitionFactor}
+            </Text>
+            
+            <Text style={styles.sectionTitle}>Audio Energy:</Text>
+            <Text style={styles.rmsText}>
+              RMS: {rms.toFixed(2)}
+            </Text>
+
+            <View style={styles.divider} />
+            <Text style={styles.sectionTitle}>Decision Engine:</Text>
+            <Text style={styles.bodyText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
+            <Text style={styles.bodyText}>Decision: {decision}</Text>
           </View>
         )}
 
@@ -140,7 +151,7 @@ export default function ProtectionModeScreen() {
         <View style={{ height: 16 }} />
         <Button 
           title="Back to Home"
-          onPress={() => navigation.goBack()}
+          onPress={() => navigation.navigate('Home')}
           variant="secondary"
         />
       </ScrollView>
@@ -216,6 +227,50 @@ const styles = StyleSheet.create({
     ...Typography.h3,
     color: Colors.primary,
     textAlign: 'center',
+    marginBottom: 8,
+  },
+  rmsText: {
+    ...Typography.h3,
+    color: Colors.secondary,
+    textAlign: 'center',
+  },
+  bodyText: {
+    ...Typography.body1,
+    color: Colors.textSecondary,
+    marginBottom: 4,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: Colors.border,
+    marginVertical: 16,
+  },
+  alertBox: {
+    backgroundColor: '#ffebee',
+    padding: 20,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#f44336',
+    width: '100%',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  alertTitle: {
+    ...Typography.h2,
+    color: '#d32f2f',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  alertText: {
+    ...Typography.body1,
+    color: '#d32f2f',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  countdownText: {
+    fontSize: 48,
+    fontWeight: 'bold',
+    color: '#d32f2f',
+    marginVertical: 16,
   },
   spacer: {
     flex: 1,

@@ -7,6 +7,8 @@ export type RootStackParamList = {
   EmergencyAlert: undefined;
   EmergencyContacts: undefined;
   Profile: undefined;
+  Login: undefined;
+  Register: undefined;
 };
 
-export type NavigationProps = NativeStackNavigationProp<RootStackParamList>;
+export type NavigationProps = NativeStackNavigationProp<RootStackParamList, any>;

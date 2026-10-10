@@ -1,0 +1,163 @@
+diff --git a/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt b/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt
+new file mode 100644
+index 0000000..9bad8c7
+--- /dev/null
++++ b/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt
+@@ -0,0 +1,133 @@
++package com.vosk
++
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.MediaRecorder
++import android.os.Handler
++import android.os.Looper
++import org.vosk.Recognizer
++import org.vosk.android.RecognitionListener
++import kotlin.math.sqrt
++
++class CustomSpeechService(
++    private val recognizer: Recognizer,
++    private val sampleRate: Float,
++    private val emitRms: (Double) -> Unit
++) {
++
++    private var recorder: AudioRecord? = null
++    private var recognizerThread: RecognizerThread? = null
++    private val mainHandler = Handler(Looper.getMainLooper())
++
++    fun startListening(listener: RecognitionListener): Boolean {
++        if (recognizerThread != null) {
++            return false
++        }
++
++        val bufferSize = Math.round(sampleRate * 0.2f)
++        recorder = AudioRecord(
++            MediaRecorder.AudioSource.VOICE_RECOGNITION,
++            sampleRate.toInt(),
++            AudioFormat.CHANNEL_IN_MONO,
++            AudioFormat.ENCODING_PCM_16BIT,
++            bufferSize * 2
++        )
++
++        if (recorder?.state == AudioRecord.STATE_UNINITIALIZED) {
++            recorder?.release()
++            recorder = null
++            return false
++        }
++
++        recorder?.startRecording()
++        recognizerThread = RecognizerThread(listener)
++        recognizerThread?.start()
++        return true
++    }
++
++    fun startListening(listener: RecognitionListener, timeout: Int): Boolean {
++        if (startListening(listener)) {
++            mainHandler.postDelayed({
++                if (recognizerThread != null) {
++                    recognizerThread?.timeout()
++                    stop()
++                }
++            }, timeout.toLong())
++            return true
++        }
++        return false
++    }
++
++    fun stop(): Boolean {
++        if (recognizerThread == null) {
++            return false
++        }
++        try {
++            recognizerThread?.interrupt()
++            recognizerThread?.join()
++        } catch (e: InterruptedException) {
++            Thread.currentThread().interrupt()
++        }
++        recognizerThread = null
++
++        recorder?.stop()
++        recorder?.release()
++        recorder = null
++        return true
++    }
++
++    fun shutdown() {
++        stop()
++    }
++
++    private inner class RecognizerThread(private val listener: RecognitionListener) : Thread() {
++        private var timeout = false
++        private val bufferSize = Math.round(sampleRate * 0.2f)
++
++        fun timeout() {
++            timeout = true
++        }
++
++        override fun run() {
++            val buffer = ShortArray(bufferSize)
++            while (!isInterrupted) {
++                val nread = recorder?.read(buffer, 0, buffer.size) ?: -1
++                if (nread < 0) {
++                    break
++                }
++                
++                // RMS Calculation
++                if (nread > 0) {
++                    var sumSquares = 0.0
++                    for (i in 0 until nread) {
++                        val sample = buffer[i].toDouble()
++                        sumSquares += sample * sample
++                    }
++                    val rms = sqrt(sumSquares / nread)
++                    
++                    // Emit RMS safely on the main thread or via the provided callback
++                    mainHandler.post {
++                        emitRms(rms)
++                    }
++
++                    if (recognizer.acceptWaveForm(buffer, nread)) {
++                        val result = recognizer.result
++                        mainHandler.post { listener.onResult(result) }
++                    } else {
++                        val partialResult = recognizer.partialResult
++                        mainHandler.post { listener.onPartialResult(partialResult) }
++                    }
++                }
++                if (timeout) {
++                    mainHandler.post { listener.onTimeout() }
++                    break
++                }
++            }
++
++            if (!timeout) {
++                val finalResult = recognizer.finalResult
++                mainHandler.post { listener.onFinalResult(finalResult) }
++            }
++        }
++    }
++}
+diff --git a/node_modules/react-native-vosk/android/src/main/java/com/vosk/VoskModule.kt b/node_modules/react-native-vosk/android/src/main/java/com/vosk/VoskModule.kt
+index c2c4d64..19903a4 100644
+--- a/node_modules/react-native-vosk/android/src/main/java/com/vosk/VoskModule.kt
++++ b/node_modules/react-native-vosk/android/src/main/java/com/vosk/VoskModule.kt
+@@ -21,7 +21,7 @@ class VoskModule(reactContext: ReactApplicationContext) :
+         NativeVoskSpec(reactContext), RecognitionListener {
+ 
+   private var model: Model? = null
+-  private var speechService: SpeechService? = null
++  private var speechService: CustomSpeechService? = null
+   private var context: ReactApplicationContext? = reactContext
+   private var recognizer: Recognizer? = null
+   private var sampleRate = 16000.0f
+@@ -146,7 +146,9 @@ class VoskModule(reactContext: ReactApplicationContext) :
+               } else {
+                 Recognizer(model, sampleRate)
+               }
+-      speechService = SpeechService(recognizer, sampleRate)
++      speechService = CustomSpeechService(recognizer!!, sampleRate) { rms ->
++          sendEvent("onRms", rms.toString())
++      }
+       val started =
+               if (options != null && options.hasKey("timeout") && !options.isNull("timeout")) {
+                 speechService?.startListening(this, options.getInt("timeout")) ?: false
