@@ -1,0 +1,39 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.env
+*.json
+!requirements*.json
+*serviceAccount*.json
+secrets/
+
+# Python / Django
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+emergency-audio/
+*.wav
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# Logs
+*.log
+
+# Scratch / temporary scripts & test artifacts
+*.png
+update_*.py
+kill_test*.py
+write_emergency_module.py
+diagnostic.py
+debug_test.py
+
+
