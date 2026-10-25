@@ -1,11 +1,12 @@
-import React from 'react';
-import { View, Text, StyleSheet, PermissionsAndroid, Platform, Alert, ScrollView } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, PermissionsAndroid, Platform, Alert, ScrollView, TouchableOpacity } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import Header from '../components/Header';
 import Button from '../components/Button';
 import { Colors } from '../theme/colors';
 import { Typography } from '../theme/typography';
 import { useSafeVoice } from '../context/SafeVoiceContext';
+import { voskService } from '../services/voskService';
 
 export default function ProtectionModeScreen() {
   const navigation = useNavigation<any>();
@@ -23,12 +24,20 @@ export default function ProtectionModeScreen() {
     startProtectionMode,
     stopProtectionMode,
     cancelEmergency,
-    location
+    location,
+    customTrigger,
+    isSubmittingAlert
   } = useSafeVoice();
+
+  const [isToggling, setIsToggling] = useState(false);
 
   const requestMicrophonePermission = async () => {
     if (Platform.OS === 'android') {
       try {
+        const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+        if (hasPermission) {
+          return true;
+        }
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
           {
@@ -49,17 +58,43 @@ export default function ProtectionModeScreen() {
   };
 
   const handleToggle = async () => {
-    if (isProtectionActive) {
-      await stopProtectionMode();
-    } else {
-      const hasPermission = await requestMicrophonePermission();
-      if (!hasPermission) {
-        Alert.alert('Permission Denied', 'Microphone permission is required.');
-        return;
+    if (isToggling || isSubmittingAlert) return;
+    setIsToggling(true);
+
+    try {
+      if (isProtectionActive) {
+        await stopProtectionMode();
+      } else {
+        const hasPermission = await requestMicrophonePermission();
+        if (!hasPermission) {
+          Alert.alert(
+            'Microphone Permission Required',
+            'SafeVoice requires microphone access to monitor for emergency keywords. Please grant microphone permission and try again.'
+          );
+          return;
+        }
+        await startProtectionMode();
       }
-      await startProtectionMode();
+    } finally {
+      setIsToggling(false);
     }
   };
+
+  // Determine user-friendly state string
+  let currentStatusDisplay = 'Inactive';
+  if (isProtectionActive) {
+    if (decision === 'Potential Emergency' || countdown !== null) {
+      currentStatusDisplay = 'Trigger Detected!';
+    } else if (isSubmittingAlert) {
+      currentStatusDisplay = 'Sending Alert...';
+    } else if (decision === 'Confirmed') {
+      currentStatusDisplay = 'Alert Accepted';
+    } else if (voskState === 'listening') {
+      currentStatusDisplay = 'Listening...';
+    } else {
+      currentStatusDisplay = voskState;
+    }
+  }
 
   return (
     <View style={styles.container}>
@@ -70,7 +105,7 @@ export default function ProtectionModeScreen() {
           <View style={styles.alertBox}>
             <Text style={styles.alertTitle}>POTENTIAL EMERGENCY DETECTED</Text>
             <Text style={styles.alertText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
-            <Text style={styles.alertText}>Emergency response will begin in:</Text>
+            <Text style={styles.alertText}>Emergency SOS will dispatch in:</Text>
             <Text style={styles.countdownText}>{countdown}</Text>
             <Button title="CANCEL EMERGENCY" onPress={cancelEmergency} variant="danger" />
           </View>
@@ -80,10 +115,10 @@ export default function ProtectionModeScreen() {
           <View style={styles.alertBox}>
             <Text style={styles.alertTitle}>EMERGENCY CONFIRMED</Text>
             <Text style={styles.alertText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
-            <Text style={styles.alertText}>Emergency response would now begin.</Text>
+            <Text style={styles.alertText}>Emergency SOS alert has been dispatched.</Text>
             {location === 'error' ? (
               <Text style={styles.alertText}>
-                Location: Unable to retrieve location
+                Location: Unable to retrieve device GPS
               </Text>
             ) : location !== null ? (
               <Text style={styles.alertText}>
@@ -95,29 +130,50 @@ export default function ProtectionModeScreen() {
         )}
 
         <View style={styles.statusContainer}>
-          <View style={[styles.indicator, { backgroundColor: isProtectionActive ? Colors.success : Colors.error }]} />
+          <View 
+            style={[
+              styles.indicator, 
+              { 
+                backgroundColor: decision === 'Potential Emergency'
+                  ? Colors.warning 
+                  : (isProtectionActive ? Colors.success : Colors.error) 
+              }
+            ]} 
+          />
           <Text style={styles.statusText}>
             {isProtectionActive ? 'Protection Active' : 'Protection Inactive'}
           </Text>
-          {isProtectionActive && (
-            <Text style={styles.stateText}>
-              Status: {voskState === 'listening' ? 'Listening...' : voskState}
-            </Text>
-          )}
+          <Text style={[styles.stateText, decision === 'Potential Emergency' && { color: Colors.warning }]}>
+            Status: {currentStatusDisplay}
+          </Text>
         </View>
-        
+
+        {/* Configured Custom Trigger Word Indicator */}
+        <View style={styles.triggerCard}>
+          <View style={styles.triggerCardRow}>
+            <Text style={styles.triggerLabel}>Active Trigger Word:</Text>
+            <TouchableOpacity onPress={() => navigation.navigate('Profile')}>
+              <Text style={styles.triggerEditLink}>Change</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.triggerValue}>"{customTrigger || 'help me'}"</Text>
+          <Text style={styles.triggerHint}>
+            Say "{customTrigger || 'help me'}" clearly to activate the emergency SOS response immediately.
+          </Text>
+        </View>
+
         <Text style={styles.description}>
-          Emergency voice monitoring is running in the background. It will continue running even if you navigate away or minimize the app.
+          SafeVoice listens offline for your trigger phrase. Voice monitoring runs in the background and does not transmit audio to third parties.
         </Text>
 
         {isProtectionActive && (
           <View style={styles.resultsContainer}>
-            <Text style={styles.sectionTitle}>Recognized:</Text>
+            <Text style={styles.sectionTitle}>Recognized Speech:</Text>
             <Text style={styles.recognizedText}>
-              {recognizedText ? `"${recognizedText}"` : '...'}
+              {recognizedText && recognizedText.trim().length > 0 ? `"${recognizedText}"` : '(Listening for speech...)'}
             </Text>
             
-            <Text style={styles.sectionTitle}>Detected:</Text>
+            <Text style={styles.sectionTitle}>Detected Words:</Text>
             <Text style={styles.detectedKeywords}>
               {detectedKeywords.length > 0 ? detectedKeywords.join(', ') : 'None'}
             </Text>
@@ -138,15 +194,49 @@ export default function ProtectionModeScreen() {
             <Text style={styles.sectionTitle}>Decision Engine:</Text>
             <Text style={styles.bodyText}>Emergency Score: {emergencyScore.toFixed(1)}</Text>
             <Text style={styles.bodyText}>Decision: {decision}</Text>
+
+            <View style={styles.divider} />
+            <TouchableOpacity 
+              style={styles.testVoiceButton}
+              onPress={async () => {
+                try {
+                  const candidatePaths = [
+                    '/data/user/0/com.mobile/cache/speech_help_me.wav',
+                    '/sdcard/Download/speech_help_me.wav',
+                    '/data/local/tmp/speech_help_me.wav',
+                  ];
+                  let fed = false;
+                  for (const p of candidatePaths) {
+                    fed = await voskService.feedAudioFile(p);
+                    if (fed) {
+                      console.log('[TEST_VOICE] Successfully fed audio file:', p);
+                      break;
+                    }
+                  }
+                  if (!fed) {
+                    Alert.alert('Notice', 'Audio test file not found at: /data/user/0/com.mobile/cache/speech_help_me.wav');
+                  }
+                } catch (e: any) {
+                  console.warn('[TEST_VOICE_ERROR]', e);
+                }
+              }}
+            >
+              <Text style={styles.testVoiceButtonText}>🎤 Test Spoken Voice Trigger</Text>
+            </TouchableOpacity>
           </View>
         )}
 
         <View style={styles.spacer} />
 
         <Button 
-          title={isProtectionActive ? "Stop Protection Mode" : "Activate Protection Mode"}
+          title={
+            isToggling 
+              ? "Updating..." 
+              : (isProtectionActive ? "Stop Protection Mode" : "Activate Protection Mode")
+          }
           onPress={handleToggle}
           variant={isProtectionActive ? 'secondary' : 'primary'}
+          disabled={isToggling || isSubmittingAlert}
         />
         <View style={{ height: 16 }} />
         <Button 
@@ -171,14 +261,14 @@ const styles = StyleSheet.create({
   },
   statusContainer: {
     alignItems: 'center',
-    marginTop: 20,
-    marginBottom: 24,
+    marginTop: 12,
+    marginBottom: 20,
   },
   indicator: {
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    marginBottom: 16,
+    width: 90,
+    height: 90,
+    borderRadius: 45,
+    marginBottom: 14,
   },
   statusText: {
     ...Typography.h2,
@@ -187,15 +277,54 @@ const styles = StyleSheet.create({
   stateText: {
     ...Typography.body1,
     color: Colors.primary,
-    marginTop: 8,
+    marginTop: 6,
     fontWeight: 'bold',
   },
+  triggerCard: {
+    width: '100%',
+    backgroundColor: '#eff6ff',
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    borderRadius: 8,
+    padding: 14,
+    marginBottom: 16,
+  },
+  triggerCardRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  triggerLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: Colors.primary,
+    letterSpacing: 0.5,
+  },
+  triggerEditLink: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: Colors.primary,
+    textDecorationLine: 'underline',
+  },
+  triggerValue: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: Colors.primary,
+    marginVertical: 4,
+  },
+  triggerHint: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    lineHeight: 16,
+  },
   description: {
-    ...Typography.body1,
+    ...Typography.body2,
     textAlign: 'center',
     color: Colors.textSecondary,
     paddingHorizontal: 16,
-    marginBottom: 24,
+    marginBottom: 20,
+    lineHeight: 18,
   },
   resultsContainer: {
     width: '100%',
@@ -204,7 +333,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     borderColor: Colors.border,
-    marginBottom: 24,
+    marginBottom: 20,
   },
   sectionTitle: {
     ...Typography.h3,
@@ -252,7 +381,7 @@ const styles = StyleSheet.create({
     borderColor: '#f44336',
     width: '100%',
     alignItems: 'center',
-    marginBottom: 24,
+    marginBottom: 20,
   },
   alertTitle: {
     ...Typography.h2,
@@ -270,10 +399,26 @@ const styles = StyleSheet.create({
     fontSize: 48,
     fontWeight: 'bold',
     color: '#d32f2f',
-    marginVertical: 16,
+    marginVertical: 12,
   },
   spacer: {
     flex: 1,
-    minHeight: 24,
-  }
+    minHeight: 20,
+  },
+  testVoiceButton: {
+    backgroundColor: '#eff6ff',
+    borderWidth: 1.5,
+    borderColor: '#3b82f6',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginVertical: 4,
+    width: '100%',
+  },
+  testVoiceButtonText: {
+    ...Typography.body1,
+    color: '#1d4ed8',
+    fontWeight: 'bold',
+  },
 });

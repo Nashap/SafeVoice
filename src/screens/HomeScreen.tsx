@@ -56,6 +56,11 @@ export default function HomeScreen() {
           variant="secondary"
         />
         <Button 
+          title="🚨 ALERT HISTORY" 
+          onPress={() => navigation.navigate('AlertHistory')} 
+          variant="secondary"
+        />
+        <Button 
           title="👤 My Profile" 
           onPress={() => navigation.navigate('Profile')} 
           variant="secondary"

@@ -1,9 +1,9 @@
 import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { RootStackParamList } from './types';
 import { useAuth } from '../context/AuthContext';
-import { ActivityIndicator, View } from 'react-native';
+import { ActivityIndicator, View, Text } from 'react-native';
 
 import SplashScreen from '../screens/SplashScreen';
 import HomeScreen from '../screens/HomeScreen';
@@ -13,6 +13,10 @@ import EmergencyContactsScreen from '../screens/EmergencyContactsScreen';
 import ProfileScreen from '../screens/ProfileScreen';
 import LoginScreen from '../screens/LoginScreen';
 import RegisterScreen from '../screens/RegisterScreen';
+import EmergencyDetailScreen from '../screens/EmergencyDetailScreen';
+import AlertHistoryScreen from '../screens/AlertHistoryScreen';
+
+export const navigationRef = createNavigationContainerRef<RootStackParamList>();
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
@@ -21,14 +25,18 @@ export default function AppNavigator() {
 
   if (isLoading) {
     return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-        <ActivityIndicator size="large" color="#ff3b30" />
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#dc2626' }}>
+        <View style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: '#ffffff', justifyContent: 'center', alignItems: 'center', marginBottom: 20 }}>
+          <Text style={{ fontSize: 48 }}>🛡️</Text>
+        </View>
+        <Text style={{ fontSize: 28, fontWeight: 'bold', color: '#ffffff', marginBottom: 12 }}>SafeVoice</Text>
+        <ActivityIndicator size="small" color="#ffffff" />
       </View>
     );
   }
 
   return (
-    <NavigationContainer>
+    <NavigationContainer ref={navigationRef}>
       <Stack.Navigator screenOptions={{ headerShown: false }}>
         {!isAuthenticated ? (
           <>
@@ -42,7 +50,9 @@ export default function AppNavigator() {
             <Stack.Screen name="ProtectionMode" component={ProtectionModeScreen} />
             <Stack.Screen name="EmergencyAlert" component={EmergencyAlertScreen} />
             <Stack.Screen name="EmergencyContacts" component={EmergencyContactsScreen} />
+            <Stack.Screen name="AlertHistory" component={AlertHistoryScreen} />
             <Stack.Screen name="Profile" component={ProfileScreen} />
+            <Stack.Screen name="EmergencyDetail" component={EmergencyDetailScreen} />
           </>
         )}
       </Stack.Navigator>

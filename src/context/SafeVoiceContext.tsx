@@ -1,15 +1,19 @@
 import React, { createContext, useState, useContext, ReactNode, useEffect, useRef } from 'react';
 import api from '../services/api';
-import { Alert } from 'react-native';
+import { Alert, DeviceEventEmitter } from 'react-native';
 import { useAuth } from './AuthContext';
 import { StorageService } from '../services/storage';
 import { voskService } from '../services/voskService';
-import { requestLocationPermission, getCurrentLocation, LocationData } from '../services/locationService';
+import { requestLocationPermission, getCurrentLocation, getReadableLocation, LocationData } from '../services/locationService';
+import { audioEvidenceService } from '../services/audioEvidenceService';
 
 export interface Contact {
   id: string;
   name: string;
   phone: string;
+  has_registered_account?: boolean;
+  has_fcm_token?: boolean;
+  fcm_status?: 'ready' | 'no_device' | 'unregistered';
 }
 
 export interface Profile {
@@ -24,7 +28,11 @@ interface SafeVoiceContextType {
   addContact: (contact: Contact) => void;
   editContact: (contact: Contact) => void;
   deleteContact: (id: string) => void;
+  refreshContacts: () => Promise<void>;
   isLoaded: boolean;
+
+  customTrigger: string;
+  setCustomTrigger: (phrase: string) => Promise<boolean>;
 
   isProtectionActive: boolean;
   voskState: string;
@@ -38,6 +46,10 @@ interface SafeVoiceContextType {
   decision: string;
   location: LocationData | 'error' | null;
 
+  isSubmittingAlert: boolean;
+  sendEmergencyAlert: (triggerType?: string, score?: number) => Promise<{ success: boolean; message: string; data?: any }>;
+  shareGPSLocation: () => Promise<{ success: boolean; message: string; location?: LocationData }>;
+
   startProtectionMode: () => Promise<boolean>;
   stopProtectionMode: () => Promise<void>;
   cancelEmergency: () => void;
@@ -50,7 +62,11 @@ const defaultState: SafeVoiceContextType = {
   addContact: () => {},
   editContact: () => {},
   deleteContact: () => {},
+  refreshContacts: async () => {},
   isLoaded: false,
+
+  customTrigger: 'help me',
+  setCustomTrigger: async () => false,
 
   isProtectionActive: false,
   voskState: 'stopped',
@@ -63,6 +79,10 @@ const defaultState: SafeVoiceContextType = {
   countdown: null,
   decision: 'Normal',
   location: null,
+
+  isSubmittingAlert: false,
+  sendEmergencyAlert: async () => ({ success: false, message: 'Not initialized' }),
+  shareGPSLocation: async () => ({ success: false, message: 'Not initialized' }),
 
   startProtectionMode: async () => false,
   stopProtectionMode: async () => {},
@@ -77,6 +97,9 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   const { isAuthenticated, username } = useAuth();
 
+  // Custom trigger phrase configuration (default: "help me")
+  const [customTrigger, setCustomTriggerState] = useState<string>('help me');
+
   // Monitoring State
   const [isProtectionActive, setIsProtectionActive] = useState(false);
   const [voskState, setVoskState] = useState<string>('stopped');
@@ -90,10 +113,76 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   const [countdown, setCountdown] = useState<number | null>(null);
   const [decision, setDecision] = useState<string>('Normal');
   const [location, setLocation] = useState<LocationData | 'error' | null>(null);
+  const [isSubmittingAlert, setIsSubmittingAlert] = useState<boolean>(false);
 
   const lastKeywordTimeRef = useRef<number>(0);
   const lastLogTimeRef = useRef<number>(0);
   const idempotencyKeyRef = useRef<string | null>(null);
+  const isSubmittingAlertRef = useRef<boolean>(false);
+  const decisionRef = useRef<string>('Normal');
+  const countdownRef = useRef<number | null>(null);
+
+  const activeEmergencyIdRef = useRef<number | string | null>(null);
+  const latestAudioClipRef = useRef<{ filePath: string; duration: number; tag?: string } | null>(null);
+  const uploadedEmergencyIdsRef = useRef<Set<number | string>>(new Set());
+
+  // Keep refs synchronized
+  useEffect(() => {
+    decisionRef.current = decision;
+  }, [decision]);
+
+  useEffect(() => {
+    countdownRef.current = countdown;
+  }, [countdown]);
+
+  useEffect(() => {
+    voskService.customTrigger = customTrigger;
+  }, [customTrigger]);
+
+  // Handle native emergency audio clip completion or failure
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('onEmergencyAudioReady', async (data: any) => {
+      console.log('[AUDIO_READY] Received onEmergencyAudioReady event:', data);
+      let parsed = data;
+      if (typeof data === 'string') {
+        try {
+          parsed = JSON.parse(data);
+        } catch {}
+      }
+      const filePath = parsed.filePath;
+      const duration = parsed.duration || 15.0;
+      const sizeBytes = parsed.sizeBytes;
+      const rms = parsed.rms;
+      console.log(`[AUDIO_READY] WAV file ready: path=${filePath}, duration=${duration}s, sizeBytes=${sizeBytes}, rms=${rms}`);
+      latestAudioClipRef.current = { filePath, duration, tag: parsed.tag };
+
+      const activeId = activeEmergencyIdRef.current;
+      if (activeId && !uploadedEmergencyIdsRef.current.has(activeId)) {
+        uploadedEmergencyIdsRef.current.add(activeId);
+        console.log(`[AUDIO_UPLOAD] Immediately uploading clip for active emergency ID: ${activeId}`);
+        const res = await audioEvidenceService.uploadEmergencyAudio(activeId, filePath, duration);
+        console.log('[AUDIO_UPLOAD] Upload result:', res);
+        if (!res.success) {
+          uploadedEmergencyIdsRef.current.delete(activeId);
+        }
+      }
+    });
+
+    const failSub = DeviceEventEmitter.addListener('onEmergencyAudioFailure', (data: any) => {
+      let parsed = data;
+      if (typeof data === 'string') {
+        try {
+          parsed = JSON.parse(data);
+        } catch {}
+      }
+      console.warn('[AUDIO_CAPTURE_FAILURE] Native emergency audio capture failed:', parsed);
+    });
+
+    return () => {
+      sub.remove();
+      failSub.remove();
+    };
+  }, []);
 
   useEffect(() => {
     console.log(`[SafeVoiceContext] useEffect triggered. isAuthenticated: ${isAuthenticated}, username available: ${!!username}`);
@@ -116,6 +205,15 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         const storedContacts = await StorageService.loadContacts(username);
         if (storedContacts) {
           setContacts(storedContacts);
+        }
+
+        const storedTrigger = await StorageService.loadCustomTrigger(username);
+        if (storedTrigger && storedTrigger.trim().length > 0) {
+          setCustomTriggerState(storedTrigger.trim());
+          voskService.customTrigger = storedTrigger.trim();
+        } else {
+          setCustomTriggerState('help me');
+          voskService.customTrigger = 'help me';
         }
       } catch (e) {
         console.error('[SafeVoiceContext] Failed to load local storage data', e);
@@ -148,7 +246,10 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         const backendContacts = response.data.map((c: any) => ({
           id: c.id.toString(),
           name: c.name,
-          phone: c.phone
+          phone: c.phone,
+          has_registered_account: c.has_registered_account,
+          has_fcm_token: c.has_fcm_token,
+          fcm_status: c.fcm_status
         }));
         setContacts(backendContacts);
         StorageService.saveContacts(username, backendContacts);
@@ -163,16 +264,16 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     voskService.onStateChange = setVoskState;
     voskService.onPartialText = setRecognizedText;
-    
     voskService.onRmsValue = setRms;
     
     voskService.onVoskError = (e) => {
       Alert.alert('Voice Recognition Error', e);
-      stopProtectionMode();
+      setIsProtectionActive(false);
+      setRms(0);
+      voskService.stopListening();
     };
 
     return () => {
-      // Clean up listeners on unmount (only happens if the entire app closes)
       voskService.onStateChange = undefined;
       voskService.onPartialText = undefined;
       voskService.onFinalText = undefined;
@@ -181,7 +282,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     };
   }, []);
 
-  // Update onFinalText listener so it always uses latest state via setState functions
+  // Update onFinalText listener
   useEffect(() => {
     voskService.onFinalText = (text, detection) => {
       setRecognizedText(text);
@@ -200,11 +301,25 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
           lastKeywordTimeRef.current = now;
           return prevM + addedM;
         });
+
+        // Trigger SOS immediately if custom trigger was recognized
+        if (detection.isCustomTrigger) {
+          console.log(`[TRIGGER_DEBUG] Custom voice trigger detected in speech: "${text}"`);
+          if (decisionRef.current === 'Normal' && countdownRef.current === null && !isSubmittingAlertRef.current) {
+            setEmergencyScore(100);
+            setDecision('Potential Emergency');
+            setCountdown(10);
+            const key = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
+            idempotencyKeyRef.current = key;
+            audioEvidenceService.triggerCapture(key);
+            console.log(`[DECISION_DEBUG] Started emergency countdown from custom trigger.`);
+          }
+        }
       }
     };
   }, []);
 
-  // Emergency Decision Engine calculation
+  // Emergency Decision Engine calculation for standard keywords & RMS
   useEffect(() => {
     if (!isProtectionActive) return;
 
@@ -213,8 +328,13 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     const RMS_REFERENCE = 10000;
     const rmsScore = Math.min(Math.max((rms / RMS_REFERENCE) * 100, 0), 100);
     
+    // Calculate composite score
     const score = (0.50 * kScore) + (0.30 * mScore) + (0.20 * rmsScore);
-    setEmergencyScore(score);
+    
+    // Only update emergencyScore if not already overridden to 100 by custom trigger
+    if (decision !== 'Potential Emergency' && decision !== 'Confirmed') {
+      setEmergencyScore(score);
+    }
     
     const now = Date.now();
     if (now - lastLogTimeRef.current > 2000) {
@@ -223,13 +343,163 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       lastLogTimeRef.current = now;
     }
     
-    if (score >= 70 && decision === 'Normal' && countdown === null) {
+    if (score >= 70 && decision === 'Normal' && countdown === null && !isSubmittingAlertRef.current) {
       setDecision('Potential Emergency');
       setCountdown(10);
-      idempotencyKeyRef.current = new Date().getTime().toString() + '-' + Math.random().toString(36).substring(7);
+      const key = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      idempotencyKeyRef.current = key;
+      audioEvidenceService.triggerCapture(key);
       console.log(`[DECISION_DEBUG] Decision changed to Potential Emergency! Starting countdown.`);
     }
   }, [keywordCount, repetitionFactor, rms, decision, countdown, isProtectionActive]);
+
+  // Unified Emergency Dispatch Function (used by voice countdown and manual button)
+  const sendEmergencyAlert = async (
+    triggerType: string = 'manual',
+    providedScore?: number
+  ): Promise<{ success: boolean; message: string; data?: any }> => {
+    if (isSubmittingAlertRef.current) {
+      return { success: false, message: 'An emergency alert is already being processed.' };
+    }
+
+    isSubmittingAlertRef.current = true;
+    setIsSubmittingAlert(true);
+
+    const key = (triggerType === 'manual' ? null : idempotencyKeyRef.current) || `${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    idempotencyKeyRef.current = key;
+
+    // Trigger audio capture for manual SOS
+    if (triggerType === 'manual') {
+      latestAudioClipRef.current = null;
+      audioEvidenceService.triggerCapture(key);
+    } else if (!latestAudioClipRef.current) {
+      audioEvidenceService.triggerCapture(key);
+    }
+
+    let currentLoc: LocationData | 'error' | null = null;
+    try {
+      const hasPermission = await requestLocationPermission();
+      if (hasPermission) {
+        try {
+          currentLoc = await getReadableLocation();
+          setLocation(currentLoc);
+          console.log(`[GPS_DEBUG] Location obtained for alert: ${currentLoc.latitude}, ${currentLoc.longitude}, address: ${currentLoc.resolved_address}`);
+        } catch (e) {
+          console.error('[LOCATION_DEBUG] Failed to get GPS coordinates:', e);
+          currentLoc = 'error';
+          setLocation('error');
+        }
+      } else {
+        console.log('[LOCATION_DEBUG] Location permission denied.');
+        currentLoc = 'error';
+        setLocation('error');
+      }
+
+      const scoreToUse = providedScore !== undefined ? providedScore : (emergencyScore > 0 ? Math.round(emergencyScore) : 100);
+      const validLoc = (currentLoc !== 'error' && currentLoc !== null && typeof currentLoc.latitude === 'number' && typeof currentLoc.longitude === 'number' && !(currentLoc.latitude === 0 && currentLoc.longitude === 0))
+        ? currentLoc
+        : null;
+      const hasValidAddr = !!validLoc && !!validLoc.resolved_address && validLoc.resolved_address.trim().length > 0 && validLoc.resolved_address.toLowerCase() !== 'address unavailable';
+
+      const payload = {
+        trigger_type: triggerType,
+        score: scoreToUse,
+        location_lat: validLoc ? validLoc.latitude : null,
+        location_lng: validLoc ? validLoc.longitude : null,
+        resolved_address: hasValidAddr && validLoc ? validLoc.resolved_address : null,
+        google_maps_url: validLoc ? validLoc.google_maps_url : null,
+        location_accuracy: validLoc ? validLoc.accuracy : null,
+        idempotency_key: key
+      };
+
+      console.log('[SOS_DEBUG] Dispatching emergency alert to /history/:', payload);
+      const response = await api.post('/history/', payload);
+      const message = response.data?.message || 'Emergency alert dispatched successfully.';
+      console.log(`[SOS_DEBUG] /history/ response: status=${response.status}`, response.data);
+
+      const emergencyId = response.data?.id;
+      if (emergencyId) {
+        activeEmergencyIdRef.current = emergencyId;
+        if (latestAudioClipRef.current && !uploadedEmergencyIdsRef.current.has(emergencyId)) {
+          uploadedEmergencyIdsRef.current.add(emergencyId);
+          const { filePath, duration } = latestAudioClipRef.current;
+          console.log(`[AUDIO_UPLOAD] Uploading audio clip for emergency ID: ${emergencyId}`);
+          audioEvidenceService.uploadEmergencyAudio(emergencyId, filePath, duration).then((res) => {
+            console.log('[AUDIO_UPLOAD] Async upload completed:', res);
+          });
+        }
+      }
+
+      return { success: true, message, data: response.data };
+    } catch (err: any) {
+      console.error('[SOS_DEBUG] Failed to dispatch emergency alert:', err);
+      const errMsg = err.response?.data?.message || err.response?.data?.detail || err.message || 'Failed to dispatch emergency alert.';
+      return { success: false, message: errMsg };
+    } finally {
+      idempotencyKeyRef.current = null;
+      isSubmittingAlertRef.current = false;
+      setIsSubmittingAlert(false);
+    }
+  };
+
+  // Unified GPS Location Share Function
+  const shareGPSLocation = async (): Promise<{ success: boolean; message: string; location?: LocationData }> => {
+    if (isSubmittingAlertRef.current) {
+      return { success: false, message: 'A location request is already in progress.' };
+    }
+
+    isSubmittingAlertRef.current = true;
+    setIsSubmittingAlert(true);
+
+    try {
+      const hasPermission = await requestLocationPermission();
+      if (!hasPermission) {
+        setLocation('error');
+        return {
+          success: false,
+          message: 'Location permission was denied. Please enable location permissions in device settings to share GPS coordinates.'
+        };
+      }
+
+      let currentLoc: LocationData;
+      try {
+        currentLoc = await getReadableLocation();
+        setLocation(currentLoc);
+        console.log(`[GPS_DEBUG] Location retrieved for sharing: ${currentLoc.latitude}, ${currentLoc.longitude}, address: ${currentLoc.resolved_address}`);
+      } catch (e: any) {
+        console.error('[LOCATION_DEBUG] Failed to get GPS coordinates for sharing:', e);
+        setLocation('error');
+        return {
+          success: false,
+          message: 'Unable to retrieve device GPS coordinates. Please ensure GPS is enabled and try again.'
+        };
+      }
+
+      const key = `${Date.now()}-loc-${Math.random().toString(36).substring(7)}`;
+      const payload = {
+        trigger_type: 'location_share',
+        score: 50,
+        location_lat: currentLoc.latitude,
+        location_lng: currentLoc.longitude,
+        resolved_address: currentLoc.resolved_address || null,
+        google_maps_url: currentLoc.google_maps_url || null,
+        location_accuracy: currentLoc.accuracy || null,
+        idempotency_key: key
+      };
+
+      console.log('[GPS_SHARE] Sending location share to backend:', payload);
+      const response = await api.post('/history/', payload);
+      const message = response.data?.message || `GPS coordinates shared: ${currentLoc.latitude.toFixed(5)}, ${currentLoc.longitude.toFixed(5)}`;
+      return { success: true, message, location: currentLoc };
+    } catch (err: any) {
+      console.error('[GPS_SHARE] Failed to share location:', err);
+      const errMsg = err.response?.data?.message || err.message || 'Failed to share location with emergency contacts.';
+      return { success: false, message: errMsg };
+    } finally {
+      isSubmittingAlertRef.current = false;
+      setIsSubmittingAlert(false);
+    }
+  };
 
   // Countdown Timer and Confirmation Reset
   useEffect(() => {
@@ -243,51 +513,19 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       setCountdown(null);
       console.log(`[DECISION_DEBUG] Emergency Confirmed!`);
       
-      const fetchLocationAndAlert = async () => {
-        let currentLoc: LocationData | 'error' | null = null;
-        const hasPermission = await requestLocationPermission();
-        if (hasPermission) {
-          try {
-            currentLoc = await getCurrentLocation();
-            setLocation(currentLoc);
-            console.log(`[GPS_DEBUG] location state updated`);
-          } catch (e) {
-            console.error('[LOCATION_DEBUG] Failed to get location:', e);
-            currentLoc = 'error';
-            setLocation('error');
-            console.log(`[GPS_DEBUG] location state updated`);
-          }
+      const executeAlert = async () => {
+        const result = await sendEmergencyAlert('keyword');
+        if (result.success) {
+          console.log('[SOS_DEBUG] Backend confirmed SOS alert delivery!');
+          Alert.alert('SOS Dispatched', result.message);
         } else {
-          console.log('[LOCATION_DEBUG] Location permission denied.');
-          currentLoc = 'error';
-          setLocation('error');
-          console.log(`[GPS_DEBUG] location state updated`);
-        }
-
-        try {
-          const payload = {
-            trigger_type: 'keyword',
-            score: Math.round(emergencyScore),
-            location_lat: currentLoc !== 'error' && currentLoc ? currentLoc.latitude : null,
-            location_lng: currentLoc !== 'error' && currentLoc ? currentLoc.longitude : null,
-            idempotency_key: idempotencyKeyRef.current
-          };
-          const response = await api.post('/history/', payload);
-          if (response.data.status === 'dispatched') {
-            console.log('[SOS_DEBUG] Backend confirmed SOS alert delivery!');
-            Alert.alert('SOS Dispatched', response.data.message || 'Your emergency alert was successfully dispatched.');
-          } else {
-            console.log('[SOS_DEBUG] Backend recorded SOS but dispatch failed.');
-            Alert.alert('SOS Recorded', response.data.message || 'SOS recorded, but push notifications failed. Please call for help.');
-          }
-        } catch (e) {
-          console.error('[SOS_DEBUG] Backend failed to record SOS.', e);
-          Alert.alert('Dispatch Error', 'Failed to dispatch SOS alert. Please try calling emergency services manually.');
+          console.log('[SOS_DEBUG] Backend recorded SOS or dispatch encountered error.');
+          Alert.alert('Dispatch Alert', result.message);
         }
       };
-      fetchLocationAndAlert();
+      executeAlert();
     } else if (decision === 'Confirmed') {
-      // Hold the Confirmed display for 3 seconds then reset monitoring state
+      // Hold the Confirmed display for 4 seconds then reset monitoring state
       timer = setTimeout(() => {
         setCountdown(null);
         setDecision('Normal');
@@ -298,7 +536,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         lastKeywordTimeRef.current = 0;
         idempotencyKeyRef.current = null;
         console.log(`[DECISION_DEBUG] Returning to Normal monitoring state.`);
-      }, 3000);
+      }, 4000);
     }
     return () => clearTimeout(timer);
   }, [countdown, decision, isProtectionActive]);
@@ -317,14 +555,28 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     setRecognizedText('');
     setRms(0);
     
-    setIsProtectionActive(true);
-    await voskService.startListening();
-    return true;
+    try {
+      const started = await voskService.startListening();
+      if (!started) {
+        setIsProtectionActive(false);
+        Alert.alert('Microphone Error', 'Failed to start microphone or speech recognition service. Please check microphone permissions and try again.');
+        return false;
+      }
+      setIsProtectionActive(true);
+      return true;
+    } catch (err) {
+      console.error('Failed to start protection mode', err);
+      setIsProtectionActive(false);
+      Alert.alert('Microphone Error', 'Unable to initialize audio capture. Please try again.');
+      return false;
+    }
   };
 
   const stopProtectionMode = async () => {
-    if (!isProtectionActive) return;
     setIsProtectionActive(false);
+    setRms(0);
+    setCountdown(null);
+    setDecision('Normal');
     await voskService.stopListening();
   };
 
@@ -337,12 +589,36 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     setEmergencyScore(0);
     lastKeywordTimeRef.current = 0;
     idempotencyKeyRef.current = null;
+    activeEmergencyIdRef.current = null;
+    latestAudioClipRef.current = null;
+    console.log('[DECISION_DEBUG] Emergency cancelled by user.');
   };
 
-  const setProfile = (newProfile: Profile) => {
+  const setCustomTrigger = async (phrase: string): Promise<boolean> => {
+    const trimmed = (phrase || '').trim();
+    if (trimmed.length < 2 || trimmed.length > 40 || !/[a-zA-Z]/.test(trimmed)) {
+      return false;
+    }
+    setCustomTriggerState(trimmed);
+    voskService.customTrigger = trimmed;
+    if (username) {
+      await StorageService.saveCustomTrigger(username, trimmed);
+    }
+    return true;
+  };
+
+  const setProfile = async (newProfile: Profile) => {
     setProfileState(newProfile);
     if (username) {
       StorageService.saveProfile(username, newProfile);
+    }
+    try {
+      if (newProfile.phone) {
+        await api.patch('/users/me/', { phone_number: newProfile.phone });
+        console.log('[SafeVoiceContext] Successfully synced phone_number to backend /users/me/');
+      }
+    } catch (err) {
+      console.error('[SafeVoiceContext] Failed to sync profile to backend:', err);
     }
   };
   
@@ -352,7 +628,13 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         name: contact.name,
         phone: contact.phone
       });
-      const newContact = { ...contact, id: response.data.id.toString() };
+      const newContact: Contact = {
+        ...contact,
+        id: response.data.id.toString(),
+        has_registered_account: response.data.has_registered_account,
+        has_fcm_token: response.data.has_fcm_token,
+        fcm_status: response.data.fcm_status
+      };
       const updated = [...contacts, newContact];
       setContacts(updated);
       if (username) StorageService.saveContacts(username, updated);
@@ -364,16 +646,40 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   
   const editContact = async (updatedContact: Contact) => {
     try {
-      await api.put(`/contacts/${updatedContact.id}/`, {
+      const response = await api.put(`/contacts/${updatedContact.id}/`, {
         name: updatedContact.name,
         phone: updatedContact.phone
       });
-      const updated = contacts.map(c => c.id === updatedContact.id ? updatedContact : c);
+      const savedContact: Contact = {
+        ...updatedContact,
+        has_registered_account: response.data?.has_registered_account,
+        has_fcm_token: response.data?.has_fcm_token,
+        fcm_status: response.data?.fcm_status
+      };
+      const updated = contacts.map(c => c.id === updatedContact.id ? savedContact : c);
       setContacts(updated);
       if (username) StorageService.saveContacts(username, updated);
     } catch (e) {
       console.error(e);
       Alert.alert('Error', 'Failed to update contact on the server.');
+    }
+  };
+
+  const refreshContacts = async () => {
+    try {
+      const response = await api.get('/contacts/');
+      const backendContacts = response.data.map((c: any) => ({
+        id: c.id.toString(),
+        name: c.name,
+        phone: c.phone,
+        has_registered_account: c.has_registered_account,
+        has_fcm_token: c.has_fcm_token,
+        fcm_status: c.fcm_status
+      }));
+      setContacts(backendContacts);
+      if (username) StorageService.saveContacts(username, backendContacts);
+    } catch (e) {
+      console.error('Failed to refresh contacts from backend', e);
     }
   };
   
@@ -398,7 +704,11 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         addContact,
         editContact,
         deleteContact,
+        refreshContacts,
         isLoaded,
+
+        customTrigger,
+        setCustomTrigger,
         
         isProtectionActive,
         voskState,
@@ -411,6 +721,10 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         countdown,
         decision,
         location,
+
+        isSubmittingAlert,
+        sendEmergencyAlert,
+        shareGPSLocation,
 
         startProtectionMode,
         stopProtectionMode,

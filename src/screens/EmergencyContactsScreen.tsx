@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Alert } from 'react-native';
+import React, { useState, useCallback } from 'react';
+import { View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, Alert, RefreshControl } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import Header from '../components/Header';
 import Button from '../components/Button';
 import Card from '../components/Card';
@@ -8,13 +9,29 @@ import { Typography } from '../theme/typography';
 import { useSafeVoice, Contact } from '../context/SafeVoiceContext';
 
 export default function EmergencyContactsScreen() {
-  const { contacts, addContact, editContact, deleteContact, isLoaded } = useSafeVoice();
+  const { contacts, addContact, editContact, deleteContact, refreshContacts, isLoaded } = useSafeVoice();
   
   const [isFormVisible, setIsFormVisible] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshContacts();
+    }, [refreshContacts])
+  );
+
+  const onRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await refreshContacts();
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
 
   const openFormForAdd = () => {
     setEditingId(null);
@@ -75,28 +92,61 @@ export default function EmergencyContactsScreen() {
     );
   };
 
-  const renderItem = ({ item }: { item: Contact }) => (
-    <Card style={styles.contactCard}>
-      <View style={styles.contactInfo}>
-        <Text style={styles.contactName}>{item.name}</Text>
-        <Text style={styles.contactPhone}>{item.phone}</Text>
-      </View>
-      <View style={styles.actionButtons}>
-        <TouchableOpacity 
-          style={styles.iconBtn}
-          onPress={() => openFormForEdit(item)}
-        >
-          <Text style={styles.iconText}>✏️</Text>
-        </TouchableOpacity>
-        <TouchableOpacity 
-          style={styles.iconBtn}
-          onPress={() => handleDelete(item.id)}
-        >
-          <Text style={styles.iconText}>🗑️</Text>
-        </TouchableOpacity>
-      </View>
-    </Card>
-  );
+  const renderItem = ({ item }: { item: Contact }) => {
+    const isPushReady = item.fcm_status === 'ready';
+    const isNoDevice = item.fcm_status === 'no_device';
+    const isUnregistered = item.fcm_status === 'unregistered' || !item.fcm_status;
+
+    return (
+      <Card style={styles.contactCard}>
+        <View style={styles.contactInfo}>
+          <Text style={styles.contactName}>{item.name}</Text>
+          <Text style={styles.contactPhone}>{item.phone}</Text>
+
+          <View style={styles.badgeRow}>
+            {isPushReady && (
+              <View style={[styles.statusBadge, styles.badgeSuccess]}>
+                <Text style={styles.badgeTextSuccess}>🔔 Push Alerts Active</Text>
+              </View>
+            )}
+            {isNoDevice && (
+              <View style={[styles.statusBadge, styles.badgeWarning]}>
+                <Text style={styles.badgeTextWarning}>📱 App Linked (No Device Active)</Text>
+              </View>
+            )}
+            {isUnregistered && (
+              <View style={[styles.statusBadge, styles.badgeMuted]}>
+                <Text style={styles.badgeTextMuted}>✉️ SMS Fallback (Not on SafeVoice)</Text>
+              </View>
+            )}
+          </View>
+
+          <Text style={styles.statusDescription}>
+            {isPushReady
+              ? 'SafeVoice linked: Receives instant push notifications with GPS map.'
+              : isNoDevice
+              ? 'Recipient registered, but needs to open SafeVoice to activate notifications.'
+              : 'Recipient has not registered on SafeVoice. Push notifications unavailable until they register.'}
+          </Text>
+        </View>
+
+        <View style={styles.actionButtons}>
+          <TouchableOpacity 
+            style={styles.iconBtn}
+            onPress={() => openFormForEdit(item)}
+          >
+            <Text style={styles.iconText}>✏️</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.iconBtn}
+            onPress={() => handleDelete(item.id)}
+          >
+            <Text style={styles.iconText}>🗑️</Text>
+          </TouchableOpacity>
+        </View>
+      </Card>
+    );
+  };
 
   if (!isLoaded) {
     return (
@@ -113,6 +163,13 @@ export default function EmergencyContactsScreen() {
     <View style={styles.container}>
       <Header title="Emergency Contacts" />
       <View style={styles.content}>
+        <View style={styles.infoBanner}>
+          <Text style={styles.infoBannerTitle}>Automatic Contact Linking</Text>
+          <Text style={styles.infoBannerText}>
+            When a contact installs SafeVoice with their phone number, push notifications activate automatically. No token setup required.
+          </Text>
+        </View>
+
         {isFormVisible ? (
           <Card style={styles.formCard}>
             <Text style={styles.formTitle}>
@@ -126,11 +183,14 @@ export default function EmergencyContactsScreen() {
             />
             <TextInput 
               style={styles.input}
-              placeholder="Phone Number"
+              placeholder="Phone Number (e.g. 9847401916)"
               value={phone}
               onChangeText={setPhone}
               keyboardType="phone-pad"
             />
+            <Text style={styles.fieldHint}>
+              Enter the phone number the contact will use to register on SafeVoice.
+            </Text>
             <View style={styles.formActions}>
               <Button title="Cancel" onPress={closeForm} variant="secondary" style={styles.flexBtn} />
               <View style={styles.btnSpacer} />
@@ -150,6 +210,9 @@ export default function EmergencyContactsScreen() {
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
           contentContainerStyle={styles.list}
+          refreshControl={
+            <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
+          }
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
               <Text style={styles.emptyTitle}>No emergency contacts added yet.</Text>
@@ -171,6 +234,26 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
   },
+  infoBanner: {
+    backgroundColor: '#eff6ff',
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 16,
+  },
+  infoBannerTitle: {
+    ...Typography.body2,
+    fontWeight: 'bold',
+    color: '#1e40af',
+    marginBottom: 4,
+  },
+  infoBannerText: {
+    ...Typography.body2,
+    color: '#1e3a8a',
+    fontSize: 13,
+    lineHeight: 18,
+  },
   addBtn: {
     marginBottom: 16,
   },
@@ -179,9 +262,10 @@ const styles = StyleSheet.create({
   },
   contactCard: {
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     justifyContent: 'space-between',
     padding: 16,
+    marginBottom: 12,
   },
   contactInfo: {
     flex: 1,
@@ -193,14 +277,63 @@ const styles = StyleSheet.create({
   contactPhone: {
     ...Typography.body1,
     color: Colors.textSecondary,
-    marginTop: 4,
+    marginTop: 2,
+    marginBottom: 8,
+  },
+  badgeRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
+  statusBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    marginRight: 6,
+    marginBottom: 4,
+  },
+  badgeSuccess: {
+    backgroundColor: '#ecfdf5',
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
+  },
+  badgeTextSuccess: {
+    color: '#065f46',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  badgeWarning: {
+    backgroundColor: '#fffbeb',
+    borderWidth: 1,
+    borderColor: '#fde68a',
+  },
+  badgeTextWarning: {
+    color: '#92400e',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  badgeMuted: {
+    backgroundColor: '#f3f4f6',
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+  },
+  badgeTextMuted: {
+    color: '#4b5563',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  statusDescription: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    lineHeight: 16,
   },
   actionButtons: {
     flexDirection: 'row',
+    marginLeft: 8,
   },
   iconBtn: {
     padding: 8,
-    marginLeft: 8,
+    marginLeft: 4,
   },
   iconText: {
     fontSize: 20,
@@ -217,8 +350,13 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
     borderRadius: 8,
     padding: 12,
-    marginBottom: 16,
+    marginBottom: 12,
     ...Typography.body1,
+  },
+  fieldHint: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    marginBottom: 16,
   },
   formActions: {
     flexDirection: 'row',

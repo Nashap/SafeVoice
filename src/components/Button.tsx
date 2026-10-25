@@ -9,10 +9,12 @@ interface ButtonProps {
   variant?: 'primary' | 'secondary' | 'danger';
   style?: ViewStyle;
   textStyle?: TextStyle;
+  disabled?: boolean;
 }
 
-export default function Button({ title, onPress, variant = 'primary', style, textStyle }: ButtonProps) {
+export default function Button({ title, onPress, variant = 'primary', style, textStyle, disabled = false }: ButtonProps) {
   const getBackgroundColor = () => {
+    if (disabled) return Colors.border;
     switch (variant) {
       case 'danger': return Colors.error;
       case 'secondary': return Colors.secondary;
@@ -23,9 +25,14 @@ export default function Button({ title, onPress, variant = 'primary', style, tex
 
   return (
     <TouchableOpacity
-      style={[styles.button, { backgroundColor: getBackgroundColor() }, style]}
-      onPress={onPress}
-      activeOpacity={0.8}
+      style={[
+        styles.button, 
+        { backgroundColor: getBackgroundColor(), opacity: disabled ? 0.6 : 1 }, 
+        style
+      ]}
+      onPress={disabled ? undefined : onPress}
+      disabled={disabled}
+      activeOpacity={disabled ? 1 : 0.8}
     >
       <Text style={[styles.text, textStyle]}>{title}</Text>
     </TouchableOpacity>

@@ -42,4 +42,21 @@ export const StorageService = {
       return null;
     }
   },
+
+  async saveCustomTrigger(username: string, trigger: string): Promise<void> {
+    try {
+      await AsyncStorage.setItem(`@safevoice/custom_trigger_${username}`, trigger);
+    } catch (e) {
+      console.error('Failed to save custom trigger', e);
+    }
+  },
+
+  async loadCustomTrigger(username: string): Promise<string | null> {
+    try {
+      return await AsyncStorage.getItem(`@safevoice/custom_trigger_${username}`);
+    } catch (e) {
+      console.error('Failed to load custom trigger', e);
+      return null;
+    }
+  },
 };

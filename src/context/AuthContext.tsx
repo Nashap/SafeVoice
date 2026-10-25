@@ -1,8 +1,8 @@
-import React, { createContext, useState, useContext, ReactNode, useEffect } from 'react';
+import React, { createContext, useState, useContext, ReactNode, useEffect, useRef } from 'react';
 import { DeviceEventEmitter } from 'react-native';
 import * as Keychain from 'react-native-keychain';
 import api from '../services/api';
-import { getFCMToken } from '../services/notificationService';
+import { getFCMToken, requestNotificationPermission, setupTokenRefreshListener } from '../services/notificationService';
 
 interface AuthContextType {
   isAuthenticated: boolean;
@@ -18,12 +18,26 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [username, setUsername] = useState<string | null>(null);
+  const tokenRefreshUnsubRef = useRef<(() => void) | null>(null);
+
+  const registerDeviceToken = async (accessToken?: string) => {
+    try {
+      await requestNotificationPermission();
+      const fcmToken = await getFCMToken();
+      if (fcmToken) {
+        const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined;
+        await api.post('/devices/', { token: fcmToken }, { headers });
+        console.log('[FCM] Device token registered automatically with backend');
+      }
+    } catch (e) {
+      console.error('[FCM] Automatic device token registration failed:', e);
+    }
+  };
 
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener('auth_error', () => {
       console.log('[Auth] Intercepted auth_error, logging out');
       setIsAuthenticated(false);
-    setUsername(null);
       setUsername(null);
     });
 
@@ -37,36 +51,31 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           let currentUsername = tokens.username;
           
           if (!currentUsername) {
-            console.log('[AuthContext] Missing username in keychain. Fetching from /users/');
+            console.log('[AuthContext] Missing username in keychain. Fetching from /users/me/');
             try {
-              const userResponse = await api.get('/users/', {
+              const userResponse = await api.get('/users/me/', {
                 headers: { Authorization: `Bearer ${tokens.access}` }
               });
-              if (userResponse.data && userResponse.data.length > 0) {
-                currentUsername = userResponse.data[0].username;
+              if (userResponse.data?.username) {
+                currentUsername = userResponse.data.username;
                 console.log(`[AuthContext] Fetched username from API: ${currentUsername}`);
                 await Keychain.setGenericPassword('auth', JSON.stringify({ ...tokens, username: currentUsername }));
               }
             } catch (e) {
-              console.error("[AuthContext] Failed to fetch username for backward compatibility", e);
+              console.error("[AuthContext] Failed to fetch username from /users/me/", e);
             }
           }
           
           console.log(`[AuthContext] setUsername called with: ${currentUsername}`);
           setUsername(currentUsername || null);
           setIsAuthenticated(true);
-          // Register FCM token on app load if already authenticated
-          try {
-            const fcmToken = await getFCMToken();
-            if (fcmToken) {
-              await api.post('/devices/', { token: fcmToken }, {
-                headers: { Authorization: `Bearer ${tokens.access}` }
-              });
-              console.log('[FCM] Token registered with backend on app load');
-            }
-          } catch (e) {
-            console.error('[FCM] Failed to register device token on app load', e);
-          }
+          setIsLoading(false);
+          
+          // Automatically register device token asynchronously in the background
+          registerDeviceToken(tokens.access).catch((err) => {
+            console.warn('[AuthContext] Background token registration on startup deferred:', err);
+          });
+          return;
         }
       } catch (e) {
         console.error('Failed to restore auth state', e);
@@ -75,7 +84,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       }
     };
     checkToken();
-    return () => sub.remove();
+
+    // Listen for FCM token refresh events and automatically sync with backend
+    tokenRefreshUnsubRef.current = setupTokenRefreshListener(async (newToken) => {
+      try {
+        console.log('[AuthContext] Processing FCM token refresh...');
+        await api.post('/devices/', { token: newToken });
+        console.log('[AuthContext] Refreshed FCM token registered successfully with backend');
+      } catch (err) {
+        console.error('[AuthContext] Failed to sync refreshed token with backend:', err);
+      }
+    });
+
+    return () => {
+      sub.remove();
+      if (tokenRefreshUnsubRef.current) {
+        tokenRefreshUnsubRef.current();
+      }
+    };
   }, []);
 
   const login = async (tokens: { access: string; refresh: string }, usernameStr: string) => {
@@ -83,29 +109,26 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     setIsAuthenticated(true);
     setUsername(usernameStr);
     
-    // Register FCM token
-    try {
-      const fcmToken = await getFCMToken();
-      if (fcmToken) {
-        await api.post('/devices/', { token: fcmToken }, {
-          headers: { Authorization: `Bearer ${tokens.access}` }
-        });
-        console.log('[FCM] Token registered with backend');
-      }
-    } catch (e) {
-      console.error('[FCM] Failed to register device token with backend', e);
-    }
+    // Automatically register FCM device token in background without blocking screen transition
+    registerDeviceToken(tokens.access).catch((err) => {
+      console.warn('[AuthContext] Background device token registration on login:', err);
+    });
   };
 
   const logout = async () => {
     try {
       const fcmToken = await getFCMToken();
       if (fcmToken) {
-        await api.delete(`/devices/${fcmToken}/`);
-        console.log('[FCM] Token unregistered from backend');
+        try {
+          await api.post('/devices/unregister/', { token: fcmToken });
+          console.log('[FCM] Token unregistered via /devices/unregister/');
+        } catch {
+          await api.delete(`/devices/${fcmToken}/`);
+          console.log('[FCM] Token unregistered via DELETE fallback');
+        }
       }
     } catch (e) {
-      console.error('[FCM] Failed to unregister device token', e);
+      console.error('[FCM] Failed to unregister device token on logout:', e);
     }
     await Keychain.resetGenericPassword();
     setIsAuthenticated(false);
