@@ -3,7 +3,7 @@ import { NavigationContainer, createNavigationContainerRef } from '@react-naviga
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { RootStackParamList } from './types';
 import { useAuth } from '../context/AuthContext';
-import { ActivityIndicator, View, Text } from 'react-native';
+import { ActivityIndicator, View, Text, StyleSheet } from 'react-native';
 
 import SplashScreen from '../screens/SplashScreen';
 import HomeScreen from '../screens/HomeScreen';
@@ -25,11 +25,11 @@ export default function AppNavigator() {
 
   if (isLoading) {
     return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#dc2626' }}>
-        <View style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: '#ffffff', justifyContent: 'center', alignItems: 'center', marginBottom: 20 }}>
-          <Text style={{ fontSize: 48 }}>🛡️</Text>
+      <View style={styles.loadingContainer}>
+        <View style={styles.iconCircle}>
+          <Text style={styles.iconText}>🛡️</Text>
         </View>
-        <Text style={{ fontSize: 28, fontWeight: 'bold', color: '#ffffff', marginBottom: 12 }}>SafeVoice</Text>
+        <Text style={styles.brandTitle}>SafeVoice</Text>
         <ActivityIndicator size="small" color="#ffffff" />
       </View>
     );
@@ -59,3 +59,30 @@ export default function AppNavigator() {
     </NavigationContainer>
   );
 }
+
+const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#dc2626',
+  },
+  iconCircle: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: '#ffffff',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  iconText: {
+    fontSize: 48,
+  },
+  brandTitle: {
+    fontSize: 28,
+    fontWeight: 'bold',
+    color: '#ffffff',
+    marginBottom: 12,
+  },
+});
