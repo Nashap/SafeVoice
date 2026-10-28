@@ -10,7 +10,11 @@ export default function SplashScreen() {
 
   useEffect(() => {
     const timer = setTimeout(() => {
-      navigation.replace('Home');
+      const state = navigation.getState();
+      const currentRoute = state?.routes[state?.index]?.name;
+      if (!currentRoute || currentRoute === 'Splash') {
+        navigation.replace('Home');
+      }
     }, 2000);
     return () => clearTimeout(timer);
   }, [navigation]);

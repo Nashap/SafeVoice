@@ -61,7 +61,19 @@ class EmergencyAudioModule(private val reactContext: ReactApplicationContext) :
         if (speechService != null && speechService.isRunning()) {
             try {
                 Log.i(TAG, "[AUDIO_EVIDENCE] Vosk CustomSpeechService is active and running. Reusing existing microphone stream with 5s pre-buffer for tag: $tag")
-                val ok = speechService.triggerEmergencyCapture(tag)
+                val ok = speechService.triggerEmergencyCapture(tag, reactContext.cacheDir, object : CustomSpeechService.EmergencyCaptureListener {
+                    override fun onEmergencyAudioReady(jsonPayload: String) {
+                        mainHandler.post {
+                            sendEvent("onEmergencyAudioReady", jsonPayload)
+                        }
+                    }
+
+                    override fun onEmergencyAudioFailure(failPayload: String) {
+                        mainHandler.post {
+                            sendEvent("onEmergencyAudioFailure", failPayload)
+                        }
+                    }
+                })
                 if (ok) {
                     Log.i(TAG, "[AUDIO_EVIDENCE] Successfully delegated emergency capture to active CustomSpeechService for tag: $tag")
                     promise.resolve("Capture started via CustomSpeechService with 5s pre-buffer")
@@ -96,6 +108,80 @@ class EmergencyAudioModule(private val reactContext: ReactApplicationContext) :
         isStandaloneCapturing = true
         startStandaloneCapture(tag)
         promise.resolve("Standalone 15s audio capture started")
+    }
+
+    @ReactMethod
+    fun finalizeEmergencyCapture(promise: Promise) {
+        Log.i(TAG, "[AUDIO_EVIDENCE] finalizeEmergencyCapture called")
+        val speechService = CustomSpeechService.activeInstance
+        if (speechService != null && speechService.isRunning()) {
+            speechService.finalizeEmergencyCapture()
+            promise.resolve("Finalized Vosk capture")
+            return
+        }
+        promise.resolve("No active speech service capture to finalize")
+    }
+
+    @ReactMethod
+    fun cancelEmergencyCapture(promise: Promise) {
+        Log.i(TAG, "[AUDIO_EVIDENCE] cancelEmergencyCapture called")
+        val speechService = CustomSpeechService.activeInstance
+        if (speechService != null) {
+            speechService.cancelEmergencyCapture()
+        }
+        isStandaloneCapturing = false
+        promise.resolve("Cancelled capture")
+    }
+
+    @ReactMethod
+    fun verifyAudioFile(filePath: String, promise: Promise) {
+        try {
+            val cleanPath = if (filePath.startsWith("file://")) filePath.substring(7) else filePath
+            val file = File(cleanPath)
+            if (!file.exists()) {
+                val res = org.json.JSONObject().apply {
+                    put("exists", false)
+                    put("valid", false)
+                    put("error", "File does not exist")
+                }
+                promise.resolve(res.toString())
+                return
+            }
+            val length = file.length()
+            if (length <= 44) {
+                val res = org.json.JSONObject().apply {
+                    put("exists", true)
+                    put("valid", false)
+                    put("sizeBytes", length)
+                    put("error", "Audio file is empty or missing data chunks")
+                }
+                promise.resolve(res.toString())
+                return
+            }
+            val header = ByteArray(12)
+            java.io.FileInputStream(file).use { input ->
+                input.read(header)
+            }
+            val isRiff = header[0] == 'R'.code.toByte() && header[1] == 'I'.code.toByte() && header[2] == 'F'.code.toByte() && header[3] == 'F'.code.toByte()
+            val isWave = header[8] == 'W'.code.toByte() && header[9] == 'A'.code.toByte() && header[10] == 'V'.code.toByte() && header[11] == 'E'.code.toByte()
+            val isValid = isRiff && isWave
+            val durationEst = if (isValid) (length - 44).toDouble() / (SAMPLE_RATE * 2).toDouble() else 0.0
+            val res = org.json.JSONObject().apply {
+                put("exists", true)
+                put("valid", isValid)
+                put("sizeBytes", length)
+                put("durationEstimate", durationEst)
+                if (!isValid) put("error", "File is not a valid RIFF/WAVE audio file")
+            }
+            promise.resolve(res.toString())
+        } catch (e: Exception) {
+            val res = org.json.JSONObject().apply {
+                put("exists", false)
+                put("valid", false)
+                put("error", e.message)
+            }
+            promise.resolve(res.toString())
+        }
     }
 
     private fun startStandaloneCapture(tag: String) {

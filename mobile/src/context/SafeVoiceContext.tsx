@@ -1,11 +1,13 @@
 import React, { createContext, useState, useContext, ReactNode, useEffect, useRef } from 'react';
 import api from '../services/api';
-import { Alert, DeviceEventEmitter } from 'react-native';
+import { Alert, DeviceEventEmitter, AppState, PermissionsAndroid, Platform } from 'react-native';
 import { useAuth } from './AuthContext';
 import { StorageService } from '../services/storage';
 import { voskService } from '../services/voskService';
 import { requestLocationPermission, getCurrentLocation, getReadableLocation, LocationData } from '../services/locationService';
 import { audioEvidenceService } from '../services/audioEvidenceService';
+import { protectionService } from '../services/protectionService';
+import { requestNotificationPermission } from '../services/notificationService';
 
 export interface Contact {
   id: string;
@@ -126,6 +128,8 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   const latestAudioClipRef = useRef<{ filePath: string; duration: number; tag?: string } | null>(null);
   const uploadedEmergencyIdsRef = useRef<Set<number | string>>(new Set());
 
+  const sendEmergencyAlertRef = useRef<((triggerType?: string, providedScore?: number) => Promise<any>) | null>(null);
+
   // Keep refs synchronized
   useEffect(() => {
     decisionRef.current = decision;
@@ -157,18 +161,26 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       latestAudioClipRef.current = { filePath, duration, tag: parsed.tag };
 
       const activeId = activeEmergencyIdRef.current;
-      if (activeId && !uploadedEmergencyIdsRef.current.has(activeId)) {
-        uploadedEmergencyIdsRef.current.add(activeId);
-        console.log(`[AUDIO_UPLOAD] Immediately uploading clip for active emergency ID: ${activeId}`);
-        const res = await audioEvidenceService.uploadEmergencyAudio(activeId, filePath, duration);
-        console.log('[AUDIO_UPLOAD] Upload result:', res);
-        if (!res.success) {
-          uploadedEmergencyIdsRef.current.delete(activeId);
+      if (activeId) {
+        audioEvidenceService.associateEmergencyClip(activeId, filePath, duration);
+        if (!uploadedEmergencyIdsRef.current.has(activeId)) {
+          uploadedEmergencyIdsRef.current.add(activeId);
+          console.log(`[AUDIO_UPLOAD] Immediately uploading clip for active emergency ID: ${activeId}`);
+          api.patch(`/history/${activeId}/`, { audio_status: 'uploading' }).catch(() => {});
+          audioEvidenceService.uploadEmergencyAudio(activeId, filePath, duration).then(async (res) => {
+            console.log('[AUDIO_UPLOAD] Upload result:', res);
+            if (!res.success) {
+              uploadedEmergencyIdsRef.current.delete(activeId);
+              try {
+                await api.patch(`/history/${activeId}/`, { audio_status: 'failed' });
+              } catch (e) {}
+            }
+          });
         }
       }
     });
 
-    const failSub = DeviceEventEmitter.addListener('onEmergencyAudioFailure', (data: any) => {
+    const failSub = DeviceEventEmitter.addListener('onEmergencyAudioFailure', async (data: any) => {
       let parsed = data;
       if (typeof data === 'string') {
         try {
@@ -176,6 +188,15 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         } catch {}
       }
       console.warn('[AUDIO_CAPTURE_FAILURE] Native emergency audio capture failed:', parsed);
+      const activeId = activeEmergencyIdRef.current;
+      if (activeId) {
+        try {
+          console.log(`[AUDIO_FAILURE] Updating emergency ${activeId} audio_status to 'recording_failed'`);
+          await api.patch(`/history/${activeId}/`, { audio_status: 'recording_failed' });
+        } catch (e) {
+          console.warn('[AUDIO_FAILURE] Failed to report recording failure to backend:', e);
+        }
+      }
     });
 
     return () => {
@@ -183,6 +204,93 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       failSub.remove();
     };
   }, []);
+
+  // Listen for native foreground service lifecycle events (e.g. user stopped via notification action)
+  useEffect(() => {
+    const unsub = protectionService.subscribeStateChanges({
+      onStarted: () => {
+        setIsProtectionActive(true);
+      },
+      onStopped: () => {
+        setIsProtectionActive(false);
+        setRms(0);
+        setCountdown(null);
+        setDecision('Normal');
+      },
+      onError: (err) => {
+        setIsProtectionActive(false);
+        setRms(0);
+        setCountdown(null);
+        setDecision('Normal');
+        Alert.alert('Protection Mode Alert', err || 'Background voice monitoring stopped.');
+      },
+      onCountdownTick: (remaining: number) => {
+        setCountdown(remaining);
+      },
+      onCountdownFinished: async () => {
+        console.log('[SafeVoiceContext] Native onCountdownFinished: Auto-dispatching emergency SOS');
+        setDecision('Confirmed');
+        setCountdown(null);
+        audioEvidenceService.finalizeCapture();
+        if (sendEmergencyAlertRef.current) {
+          const result = await sendEmergencyAlertRef.current('keyword');
+          if (result?.success) {
+            console.log('[SOS_DEBUG] Emergency alert successfully dispatched from native countdown!');
+            Alert.alert('SOS Dispatched', result.message);
+          } else {
+            console.warn('[SOS_DEBUG] Dispatch alert encountered an issue:', result?.message);
+            Alert.alert('Dispatch Alert', result?.message);
+          }
+        }
+      },
+      onCountdownCancelled: () => {
+        console.log('[SafeVoiceContext] Native onCountdownCancelled');
+        audioEvidenceService.cancelCapture();
+        setCountdown(null);
+        setDecision('Normal');
+        setLocation(null);
+        setKeywordCount(0);
+        setRepetitionFactor(0);
+        setEmergencyScore(0);
+        lastKeywordTimeRef.current = 0;
+        idempotencyKeyRef.current = null;
+        activeEmergencyIdRef.current = null;
+        latestAudioClipRef.current = null;
+      },
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Sync actual native service running state on mount and when app resumes from background
+  useEffect(() => {
+    const syncNativeState = async () => {
+      try {
+        const running = await protectionService.isServiceRunning();
+        console.log(`[SafeVoiceContext] Syncing native service state: running=${running}, isProtectionActive=${isProtectionActive}`);
+        if (!running && isProtectionActive) {
+          setIsProtectionActive(false);
+          setRms(0);
+        } else if (running && !isProtectionActive) {
+          setIsProtectionActive(true);
+        }
+      } catch (e) {
+        console.warn('[SafeVoiceContext] Error syncing native service state:', e);
+      }
+    };
+
+    syncNativeState();
+
+    const appStateSub = AppState.addEventListener('change', (nextAppState) => {
+      if (nextAppState === 'active') {
+        syncNativeState();
+      }
+    });
+
+    return () => {
+      appStateSub.remove();
+    };
+  }, [isProtectionActive]);
 
   useEffect(() => {
     console.log(`[SafeVoiceContext] useEffect triggered. isAuthenticated: ${isAuthenticated}, username available: ${!!username}`);
@@ -312,6 +420,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
             const key = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
             idempotencyKeyRef.current = key;
             audioEvidenceService.triggerCapture(key);
+            protectionService.startEmergencyCountdown(10);
             console.log(`[DECISION_DEBUG] Started emergency countdown from custom trigger.`);
           }
         }
@@ -349,6 +458,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       const key = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
       idempotencyKeyRef.current = key;
       audioEvidenceService.triggerCapture(key);
+      protectionService.startEmergencyCountdown(10);
       console.log(`[DECISION_DEBUG] Decision changed to Potential Emergency! Starting countdown.`);
     }
   }, [keywordCount, repetitionFactor, rms, decision, countdown, isProtectionActive]);
@@ -401,6 +511,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         : null;
       const hasValidAddr = !!validLoc && !!validLoc.resolved_address && validLoc.resolved_address.trim().length > 0 && validLoc.resolved_address.toLowerCase() !== 'address unavailable';
 
+      const isVoiceOrManual = triggerType === 'keyword' || triggerType === 'manual';
       const payload = {
         trigger_type: triggerType,
         score: scoreToUse,
@@ -409,7 +520,8 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         resolved_address: hasValidAddr && validLoc ? validLoc.resolved_address : null,
         google_maps_url: validLoc ? validLoc.google_maps_url : null,
         location_accuracy: validLoc ? validLoc.accuracy : null,
-        idempotency_key: key
+        idempotency_key: key,
+        audio_status: isVoiceOrManual ? (latestAudioClipRef.current ? 'uploading' : 'preparing') : 'none'
       };
 
       console.log('[SOS_DEBUG] Dispatching emergency alert to /history/:', payload);
@@ -420,13 +532,23 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       const emergencyId = response.data?.id;
       if (emergencyId) {
         activeEmergencyIdRef.current = emergencyId;
-        if (latestAudioClipRef.current && !uploadedEmergencyIdsRef.current.has(emergencyId)) {
-          uploadedEmergencyIdsRef.current.add(emergencyId);
+        if (latestAudioClipRef.current) {
           const { filePath, duration } = latestAudioClipRef.current;
-          console.log(`[AUDIO_UPLOAD] Uploading audio clip for emergency ID: ${emergencyId}`);
-          audioEvidenceService.uploadEmergencyAudio(emergencyId, filePath, duration).then((res) => {
-            console.log('[AUDIO_UPLOAD] Async upload completed:', res);
-          });
+          audioEvidenceService.associateEmergencyClip(emergencyId, filePath, duration);
+          if (!uploadedEmergencyIdsRef.current.has(emergencyId)) {
+            uploadedEmergencyIdsRef.current.add(emergencyId);
+            console.log(`[AUDIO_UPLOAD] Uploading audio clip for emergency ID: ${emergencyId}`);
+            api.patch(`/history/${emergencyId}/`, { audio_status: 'uploading' }).catch(() => {});
+            audioEvidenceService.uploadEmergencyAudio(emergencyId, filePath, duration).then(async (res) => {
+              console.log('[AUDIO_UPLOAD] Async upload completed:', res);
+              if (!res.success) {
+                uploadedEmergencyIdsRef.current.delete(emergencyId);
+                try {
+                  await api.patch(`/history/${emergencyId}/`, { audio_status: 'failed' });
+                } catch (e) {}
+              }
+            });
+          }
         }
       }
 
@@ -441,6 +563,10 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       setIsSubmittingAlert(false);
     }
   };
+
+  useEffect(() => {
+    sendEmergencyAlertRef.current = sendEmergencyAlert;
+  }, [sendEmergencyAlert]);
 
   // Unified GPS Location Share Function
   const shareGPSLocation = async (): Promise<{ success: boolean; message: string; location?: LocationData }> => {
@@ -511,12 +637,17 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     } else if (countdown === 0 && decision === 'Potential Emergency') {
       setDecision('Confirmed');
       setCountdown(null);
-      console.log(`[DECISION_DEBUG] Emergency Confirmed!`);
+      console.log(`[DECISION_DEBUG] Emergency Confirmed! Finalizing audio evidence capture...`);
+      audioEvidenceService.finalizeCapture();
       
       const executeAlert = async () => {
         const result = await sendEmergencyAlert('keyword');
         if (result.success) {
           console.log('[SOS_DEBUG] Backend confirmed SOS alert delivery!');
+          protectionService.updateStatus(
+            '🚨 Emergency SOS Dispatched',
+            'Location and audio evidence sent to emergency contacts.'
+          );
           Alert.alert('SOS Dispatched', result.message);
         } else {
           console.log('[SOS_DEBUG] Backend recorded SOS or dispatch encountered error.');
@@ -541,8 +672,45 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     return () => clearTimeout(timer);
   }, [countdown, decision, isProtectionActive]);
 
+  const requestMicrophonePermission = async (): Promise<boolean> => {
+    if (Platform.OS === 'android') {
+      try {
+        const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+        if (hasPermission) return true;
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+          {
+            title: 'Microphone Permission',
+            message: 'SafeVoice requires microphone access for offline voice monitoring.',
+            buttonPositive: 'OK',
+            buttonNegative: 'Cancel',
+          }
+        );
+        return granted === PermissionsAndroid.RESULTS.GRANTED;
+      } catch (e) {
+        console.warn('[SafeVoiceContext] Error requesting RECORD_AUDIO permission:', e);
+        return false;
+      }
+    }
+    return true;
+  };
+
   const startProtectionMode = async (): Promise<boolean> => {
     if (isProtectionActive) return true;
+
+    // 1. Ensure notification permission is requested/granted (Android 13+)
+    await requestNotificationPermission();
+
+    // 2. Ensure microphone permission is granted
+    const hasMicPermission = await requestMicrophonePermission();
+    if (!hasMicPermission) {
+      setIsProtectionActive(false);
+      Alert.alert(
+        'Microphone Permission Required',
+        'SafeVoice requires microphone access to monitor for emergency keywords. Please grant microphone permission.'
+      );
+      return false;
+    }
     
     setKeywordCount(0);
     setRepetitionFactor(0);
@@ -556,31 +724,45 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     setRms(0);
     
     try {
+      // 3. Start native Android Foreground Service with type microphone FIRST
+      // This elevates process priority and grants background microphone recording access under Android 14+
+      await protectionService.startForegroundService(
+        'SafeVoice Protection Active',
+        'Listening for emergency triggers...'
+      );
+
+      // 4. Start Vosk offline speech recognition
       const started = await voskService.startListening();
       if (!started) {
+        await protectionService.stopForegroundService();
         setIsProtectionActive(false);
         Alert.alert('Microphone Error', 'Failed to start microphone or speech recognition service. Please check microphone permissions and try again.');
         return false;
       }
       setIsProtectionActive(true);
       return true;
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to start protection mode', err);
+      await protectionService.stopForegroundService();
       setIsProtectionActive(false);
-      Alert.alert('Microphone Error', 'Unable to initialize audio capture. Please try again.');
+      Alert.alert('Microphone Error', err?.message || 'Unable to initialize audio capture. Please try again.');
       return false;
     }
   };
 
   const stopProtectionMode = async () => {
+    protectionService.cancelEmergencyCountdown();
     setIsProtectionActive(false);
     setRms(0);
     setCountdown(null);
     setDecision('Normal');
     await voskService.stopListening();
+    await protectionService.stopForegroundService();
   };
 
   const cancelEmergency = () => {
+    protectionService.cancelEmergencyCountdown();
+    audioEvidenceService.cancelCapture();
     setCountdown(null);
     setDecision('Normal');
     setLocation(null);
@@ -591,6 +773,12 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     idempotencyKeyRef.current = null;
     activeEmergencyIdRef.current = null;
     latestAudioClipRef.current = null;
+    if (isProtectionActive) {
+      protectionService.updateStatus(
+        'SafeVoice Protection Active',
+        'Listening for emergency triggers...'
+      );
+    }
     console.log('[DECISION_DEBUG] Emergency cancelled by user.');
   };
 

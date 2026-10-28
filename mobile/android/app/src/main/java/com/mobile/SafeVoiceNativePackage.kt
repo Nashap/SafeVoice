@@ -21,6 +21,7 @@ class SafeVoiceNativePackage : BaseReactPackage() {
             EmergencyAudioModule.NAME -> EmergencyAudioModule(reactContext)
             AudioPlayerModule.NAME -> AudioPlayerModule(reactContext)
             LocationHelperModule.NAME -> LocationHelperModule(reactContext)
+            ProtectionServiceModule.NAME -> ProtectionServiceModule(reactContext)
             else -> null
         }
     }
@@ -53,6 +54,14 @@ class SafeVoiceNativePackage : BaseReactPackage() {
                 false,
                 false
             )
+            moduleInfos[ProtectionServiceModule.NAME] = ReactModuleInfo(
+                ProtectionServiceModule.NAME,
+                ProtectionServiceModule::class.java.name,
+                false,
+                false,
+                false,
+                false
+            )
             moduleInfos
         }
     }
@@ -63,7 +72,8 @@ class SafeVoiceNativePackage : BaseReactPackage() {
         return listOf(
             AudioPlayerModule(reactContext),
             LocationHelperModule(reactContext),
-            EmergencyAudioModule(reactContext)
+            EmergencyAudioModule(reactContext),
+            ProtectionServiceModule(reactContext)
         )
     }
 

@@ -65,14 +65,6 @@ export default function ProtectionModeScreen() {
       if (isProtectionActive) {
         await stopProtectionMode();
       } else {
-        const hasPermission = await requestMicrophonePermission();
-        if (!hasPermission) {
-          Alert.alert(
-            'Microphone Permission Required',
-            'SafeVoice requires microphone access to monitor for emergency keywords. Please grant microphone permission and try again.'
-          );
-          return;
-        }
         await startProtectionMode();
       }
     } finally {

@@ -11,6 +11,7 @@ import {
   Clipboard,
   RefreshControl,
   SafeAreaView,
+  DeviceEventEmitter,
 } from 'react-native';
 import { RouteProp, useRoute, useNavigation } from '@react-navigation/native';
 import api from '../services/api';
@@ -30,11 +31,13 @@ interface EmergencyDetailData {
   resolved_address?: string;
   google_maps_url?: string;
   location_accuracy?: number;
-  audio_status?: 'none' | 'pending' | 'uploaded' | 'uploaded_local' | 'failed';
+  audio_status?: 'none' | 'pending' | 'preparing' | 'uploading' | 'uploaded' | 'uploaded_local' | 'failed' | 'recording_failed';
   audio_duration?: number;
   audio_mime_type?: string;
   audio_path?: string;
   user?: number;
+  sender_name?: string;
+  sender_phone?: string;
 }
 
 export default function EmergencyDetailScreen() {
@@ -59,7 +62,12 @@ export default function EmergencyDetailScreen() {
   const [isUrlLoading, setIsUrlLoading] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
 
+  // Upload Progress and Timeout States
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [isRetryingUpload, setIsRetryingUpload] = useState(false);
+  const [isUploadTimedOut, setIsUploadTimedOut] = useState(false);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollCountRef = useRef(0);
 
   // Fetch list of recent emergency incidents
   const fetchRecentList = useCallback(async () => {
@@ -132,6 +140,9 @@ export default function EmergencyDetailScreen() {
     await audioEvidenceService.stop();
     setSignedAudioUrl(null);
     setAudioError(null);
+    setUploadProgress(null);
+    setIsUploadTimedOut(false);
+    pollCountRef.current = 0;
     setPlaybackStatus({ status: 'paused', position: 0, duration: 0 });
 
     setCurrentId(newId);
@@ -139,11 +150,36 @@ export default function EmergencyDetailScreen() {
     await fetchEmergencyDetails(newId);
   };
 
-  // If audio is pending, poll every 3 seconds until uploaded
+  // Listen to live upload progress for the current incident
   useEffect(() => {
-    if (emergency?.audio_status === 'pending') {
-      pollIntervalRef.current = setInterval(() => {
-        if (currentId) fetchEmergencyDetails(currentId);
+    const sub = DeviceEventEmitter.addListener('onAudioUploadProgress', (event: any) => {
+      if (currentId && (String(event.emergencyId) === String(currentId) || Number(event.emergencyId) === currentId)) {
+        setUploadProgress(event.percent);
+      }
+    });
+    return () => sub.remove();
+  }, [currentId]);
+
+  // If audio is in progress (pending, preparing, uploading), poll with a bounded 45s timeout
+  useEffect(() => {
+    const status = emergency?.audio_status;
+    const isTransitional = status === 'pending' || status === 'preparing' || status === 'uploading';
+
+    if (isTransitional && !isUploadTimedOut) {
+      pollCountRef.current = 0;
+      pollIntervalRef.current = setInterval(async () => {
+        pollCountRef.current += 1;
+        if (pollCountRef.current >= 15) { // 45 seconds timeout (15 * 3s)
+          if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+          }
+          setIsUploadTimedOut(true);
+          return;
+        }
+        if (currentId) {
+          await fetchEmergencyDetails(currentId);
+        }
       }, 3000);
     } else {
       if (pollIntervalRef.current) {
@@ -154,9 +190,32 @@ export default function EmergencyDetailScreen() {
     return () => {
       if (pollIntervalRef.current) {
         clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
       }
     };
-  }, [emergency?.audio_status, currentId, fetchEmergencyDetails]);
+  }, [emergency?.audio_status, currentId, fetchEmergencyDetails, isUploadTimedOut]);
+
+  const handleRetryUpload = async () => {
+    if (!currentId) return;
+    setIsRetryingUpload(true);
+    setUploadProgress(null);
+    try {
+      const res = await audioEvidenceService.retryUpload(currentId, (percent) => {
+        setUploadProgress(percent);
+      });
+      if (res.success) {
+        setIsUploadTimedOut(false);
+        await fetchEmergencyDetails(currentId, true);
+        Alert.alert('Upload Succeeded', 'Audio evidence clip was successfully uploaded to secure Supabase Storage.');
+      } else {
+        Alert.alert('Retry Notice', res.error || 'Failed to upload audio evidence.');
+      }
+    } catch (e: any) {
+      Alert.alert('Retry Error', e?.message || 'Unexpected error while retrying upload.');
+    } finally {
+      setIsRetryingUpload(false);
+    }
+  };
 
   // Audio Player Event Subscription
   useEffect(() => {
@@ -358,6 +417,11 @@ export default function EmergencyDetailScreen() {
               <Text style={styles.scoreBadgeText}>Score: {emergency.score}%</Text>
             </View>
           </View>
+          {emergency.sender_name && (
+            <Text style={styles.senderText}>
+              👤 Sender: {emergency.sender_name}{emergency.sender_phone ? ` (${emergency.sender_phone})` : ''}
+            </Text>
+          )}
           <Text style={styles.triggerType}>
             Trigger: {emergency.trigger_type.replace('_', ' ').toUpperCase()}
           </Text>
@@ -479,21 +543,63 @@ export default function EmergencyDetailScreen() {
                 </View>
               )}
             </View>
-          ) : emergency.audio_status === 'pending' ? (
+          ) : emergency.audio_status === 'preparing' && !isUploadTimedOut ? (
+            <View style={styles.pendingBox}>
+              <ActivityIndicator color="#f59e0b" size="small" />
+              <View style={{ flex: 1 }}>
+                <Text style={styles.pendingText}>Preparing recording...</Text>
+                <Text style={styles.pendingSubtext}>
+                  Emergency audio clip is being recorded from microphone.
+                </Text>
+              </View>
+            </View>
+          ) : (emergency.audio_status === 'uploading' || emergency.audio_status === 'pending') && !isUploadTimedOut ? (
             <View style={styles.pendingBox}>
               <ActivityIndicator color="#dc2626" size="small" />
-              <Text style={styles.pendingText}>
-                Audio recording is currently uploading to secure storage...
-              </Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.pendingText}>
+                  {uploadProgress !== null && uploadProgress > 0
+                    ? `Uploading audio evidence (${uploadProgress}%)...`
+                    : 'Uploading audio evidence to secure storage...'}
+                </Text>
+                <Text style={styles.pendingSubtext}>
+                  Encrypting and storing clip in private Supabase Storage.
+                </Text>
+              </View>
             </View>
-          ) : emergency.audio_status === 'failed' ? (
-            <View style={styles.unavailableBox}>
-              <Text style={styles.unavailableText}>Audio evidence upload failed</Text>
+          ) : emergency.audio_status === 'failed' || isUploadTimedOut ? (
+            <View style={styles.failedBox}>
+              <View style={styles.failedHeaderRow}>
+                <Text style={styles.failedIcon}>⚠️</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.failedTitle}>Upload failed — retry available</Text>
+                  <Text style={styles.failedSubtext}>
+                    {isUploadTimedOut
+                      ? 'Upload timed out. Tap retry below to upload the audio evidence.'
+                      : 'Audio recording could not be uploaded to secure storage. Tap retry below.'}
+                  </Text>
+                </View>
+              </View>
+              <TouchableOpacity
+                style={[styles.retryUploadBtn, isRetryingUpload && styles.disabledButton]}
+                onPress={handleRetryUpload}
+                disabled={isRetryingUpload}
+              >
+                {isRetryingUpload ? (
+                  <ActivityIndicator color="#ffffff" size="small" />
+                ) : (
+                  <Text style={styles.retryUploadBtnText}>🔄 Retry Audio Upload</Text>
+                )}
+              </TouchableOpacity>
             </View>
           ) : (
             <View>
               <View style={styles.unavailableBox}>
-                <Text style={styles.unavailableText}>No voice audio recording for this incident</Text>
+                <Text style={styles.unavailableText}>
+                  {emergency.audio_status === 'recording_failed'
+                    ? 'No valid audio recording available (Microphone capture failed)'
+                    : 'No valid audio recording available for this incident'}
+                </Text>
               </View>
 
               {/* Helper callout if another incident has audio (e.g. Incident 41) */}
@@ -665,6 +771,12 @@ const styles = StyleSheet.create({
     color: '#60a5fa',
     fontSize: 12,
     fontWeight: '600',
+  },
+  senderText: {
+    color: '#fca5a5',
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 6,
   },
   triggerType: {
     color: '#f8fafc',
@@ -896,5 +1008,51 @@ const styles = StyleSheet.create({
     fontSize: 12,
     textAlign: 'center',
     lineHeight: 18,
+  },
+  failedBox: {
+    backgroundColor: '#1e293b',
+    padding: 14,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#ef4444',
+  },
+  failedHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  failedIcon: {
+    fontSize: 22,
+  },
+  failedTitle: {
+    color: '#f87171',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  failedSubtext: {
+    color: '#94a3b8',
+    fontSize: 12,
+    marginTop: 2,
+    lineHeight: 16,
+  },
+  retryUploadBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 8,
+  },
+  retryUploadBtnText: {
+    color: '#ffffff',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  pendingSubtext: {
+    color: '#94a3b8',
+    fontSize: 11,
+    marginTop: 2,
   },
 });

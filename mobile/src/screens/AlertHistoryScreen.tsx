@@ -28,11 +28,13 @@ interface EmergencyAlertItem {
   resolved_address?: string;
   google_maps_url?: string;
   location_accuracy?: number;
-  audio_status?: 'none' | 'pending' | 'uploaded' | 'uploaded_local' | 'failed';
+  audio_status?: 'none' | 'pending' | 'preparing' | 'uploading' | 'uploaded' | 'uploaded_local' | 'failed' | 'recording_failed';
   audio_duration?: number;
   audio_mime_type?: string;
   audio_path?: string;
   user?: number;
+  sender_name?: string;
+  sender_phone?: string;
 }
 
 export default function AlertHistoryScreen() {
@@ -229,6 +231,10 @@ export default function AlertHistoryScreen() {
           </View>
         </View>
 
+        {item.sender_name && (
+          <Text style={styles.senderSubtext}>👤 Triggered by: {item.sender_name}</Text>
+        )}
+
         {/* Date / Time */}
         <Text style={styles.dateText}>🕒 {formatDate(item.timestamp)}</Text>
 
@@ -249,16 +255,26 @@ export default function AlertHistoryScreen() {
         <View style={styles.audioRow}>
           <View style={styles.audioStatusContainer}>
             <Text style={styles.infoIcon}>
-              {hasAudio ? '🎙️' : item.audio_status === 'pending' ? '⏳' : '🔇'}
+              {hasAudio
+                ? '🎙️'
+                : item.audio_status === 'preparing'
+                ? '🎙️'
+                : item.audio_status === 'uploading' || item.audio_status === 'pending'
+                ? '⏳'
+                : '🔇'}
             </Text>
             <View style={{ flex: 1 }}>
               <Text style={[styles.audioStatusLabel, hasAudio && styles.audioAvailableLabel]}>
                 {hasAudio
                   ? `Voice Evidence (${durationSeconds.toFixed(0)}s WAV)`
-                  : item.audio_status === 'pending'
-                  ? 'Voice Audio: Uploading...'
+                  : item.audio_status === 'preparing'
+                  ? 'Voice Audio: Preparing recording...'
+                  : item.audio_status === 'uploading' || item.audio_status === 'pending'
+                  ? 'Voice Audio: Uploading evidence...'
                   : item.audio_status === 'failed'
-                  ? 'Voice Audio: Upload Failed'
+                  ? 'Voice Audio: Upload Failed (Retry available)'
+                  : item.audio_status === 'recording_failed'
+                  ? 'Voice Audio: Recording Failed'
                   : 'No Voice Audio Recorded'}
               </Text>
               {hasAudio && (
@@ -515,6 +531,12 @@ const styles = StyleSheet.create({
     color: '#cbd5e1',
     fontSize: 11,
     fontWeight: '600',
+  },
+  senderSubtext: {
+    color: '#fca5a5',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
   },
   dateText: {
     color: '#94a3b8',

@@ -1,0 +1,27 @@
+diff --git a/node_modules/metro-file-map/src/crawlers/node/index.js b/node_modules/metro-file-map/src/crawlers/node/index.js
+index e7f9e49..c5eba0d 100644
+--- a/node_modules/metro-file-map/src/crawlers/node/index.js
++++ b/node_modules/metro-file-map/src/crawlers/node/index.js
+@@ -65,13 +65,19 @@ function find(
+             if (ignore(file)) {
+               return;
+             }
+-            if (entry.isSymbolicLink() && !includeSymlinks) {
+-              return;
++            let isDirectory = entry.isDirectory();
++            if (!isDirectory && entry.isSymbolicLink()) {
++              try {
++                isDirectory = fs.statSync(file).isDirectory();
++              } catch (_) {}
+             }
+-            if (entry.isDirectory()) {
++            if (isDirectory) {
+               search(file);
+               return;
+             }
++            if (entry.isSymbolicLink() && !includeSymlinks) {
++              return;
++            }
+             activeCalls++;
+             fs.lstat(file, (err, stat) => {
+               activeCalls--;

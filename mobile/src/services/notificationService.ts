@@ -12,7 +12,7 @@ const getMessagingInstance = () => {
   }
 };
 
-export const requestNotificationPermission = async () => {
+export const requestNotificationPermission = async (): Promise<boolean> => {
   console.log('[FCM] Checking notification permissions...');
   if (Platform.OS === 'android' && Platform.Version >= 33) {
     try {
@@ -20,7 +20,7 @@ export const requestNotificationPermission = async () => {
       const alreadyGranted = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
       if (alreadyGranted) {
         console.log('[FCM] Notification permission already granted.');
-        return;
+        return true;
       }
       console.log('[FCM] Requesting POST_NOTIFICATIONS with rationale...');
       const granted = await PermissionsAndroid.request(
@@ -34,11 +34,14 @@ export const requestNotificationPermission = async () => {
       );
       if (granted === PermissionsAndroid.RESULTS.GRANTED) {
         console.log('[FCM] Notification permission granted (Android 13+).');
+        return true;
       } else {
         console.log('[FCM] Notification permission denied (Android 13+).');
+        return false;
       }
     } catch (err) {
       console.error('[FCM] Error requesting POST_NOTIFICATIONS:', err);
+      return false;
     }
   } else {
     try {
@@ -47,9 +50,12 @@ export const requestNotificationPermission = async () => {
       if (messaging) {
         const authStatus = await requestPermission(messaging);
         console.log('[FCM] Notification authorization status:', authStatus);
+        return authStatus === 1 || authStatus === 2;
       }
+      return false;
     } catch (err) {
       console.error('[FCM] Error requesting Firebase permission:', err);
+      return false;
     }
   }
 };
@@ -98,13 +104,21 @@ const handleNotificationNavigation = (remoteMessage: any) => {
 
   console.log(`[FCM] Navigating to EmergencyDetail for emergency ID: ${emergencyId}`);
   if (navigationRef.isReady()) {
-    navigationRef.navigate('EmergencyDetail', { emergencyId });
+    try {
+      navigationRef.navigate('EmergencyDetail', { emergencyId });
+    } catch (err) {
+      console.warn('[FCM] navigationRef.navigate error:', err);
+    }
   } else {
     // Retry once navigator is ready
     const timer = setInterval(() => {
       if (navigationRef.isReady()) {
         clearInterval(timer);
-        navigationRef.navigate('EmergencyDetail', { emergencyId });
+        try {
+          navigationRef.navigate('EmergencyDetail', { emergencyId });
+        } catch (err) {
+          console.warn('[FCM] Retry navigationRef.navigate error:', err);
+        }
       }
     }, 200);
     setTimeout(() => clearInterval(timer), 5000);

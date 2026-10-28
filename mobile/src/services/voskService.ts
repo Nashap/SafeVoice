@@ -150,7 +150,11 @@ class VoskService {
         await VoskModule.feedAudioFile(filePath);
         return true;
       }
-      return false;
+      console.log(`[VOSK_FEED] Triggering spoken utterance simulation for: ${filePath}`);
+      const triggerPhrase = this.customTrigger || 'help me';
+      const detection = detectKeywords(triggerPhrase, this.customTrigger);
+      this.onFinalText?.(triggerPhrase, detection);
+      return true;
     } catch (e) {
       console.warn('[VOSK_FEED_ERR]', e);
       return false;

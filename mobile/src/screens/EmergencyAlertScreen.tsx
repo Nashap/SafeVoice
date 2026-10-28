@@ -121,6 +121,9 @@ export default function EmergencyAlertScreen() {
                 </Text>
               </>
             )}
+            <Text style={{ color: '#64748b', fontSize: 13, textAlign: 'center', marginTop: 8 }}>
+              🎙️ 15-second audio evidence is processed asynchronously and securely stored.
+            </Text>
             <View style={{ height: 16 }} />
             {lastEmergencyId && (
               <Button

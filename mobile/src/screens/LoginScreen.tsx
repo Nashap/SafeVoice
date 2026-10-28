@@ -16,14 +16,15 @@ export default function LoginScreen({ navigation }: Props) {
   const { login } = useAuth();
 
   const handleLogin = async () => {
-    if (!username || !password) {
-      Alert.alert('Error', 'Please enter both username and password.');
+    const cleanIdentifier = username.trim();
+    if (!cleanIdentifier || !password) {
+      Alert.alert('Error', 'Please enter both username/email and password.');
       return;
     }
     setLoading(true);
     try {
-      const response = await api.post('/auth/login/', { username, password });
-      await login(response.data, username);
+      const response = await api.post('/auth/login/', { username: cleanIdentifier, password });
+      await login(response.data, response.data.username || cleanIdentifier);
     } catch (error: any) {
       Alert.alert('Login Failed', error.response?.data?.detail || 'Invalid credentials');
     } finally {
@@ -36,7 +37,7 @@ export default function LoginScreen({ navigation }: Props) {
       <Text style={styles.title}>SafeVoice</Text>
       <TextInput
         style={styles.input}
-        placeholder="Username"
+        placeholder="Username, Email, or Phone"
         value={username}
         onChangeText={setUsername}
         autoCapitalize="none"

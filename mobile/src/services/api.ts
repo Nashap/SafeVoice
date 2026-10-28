@@ -28,6 +28,9 @@ const processQueue = (error: any, token: string | null = null) => {
 
 api.interceptors.request.use(
   async (config) => {
+    if (config.data instanceof FormData && config.headers) {
+      delete config.headers['Content-Type'];
+    }
     const credentials = await Keychain.getGenericPassword();
     if (credentials) {
       try {

@@ -1,9 +1,9 @@
 diff --git a/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt b/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt
 new file mode 100644
-index 0000000..9bad8c7
+index 0000000..f6b61df
 --- /dev/null
 +++ b/node_modules/react-native-vosk/android/src/main/java/com/vosk/CustomSpeechService.kt
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,468 @@
 +package com.vosk
 +
 +import android.media.AudioFormat
@@ -11,8 +11,14 @@ index 0000000..9bad8c7
 +import android.media.MediaRecorder
 +import android.os.Handler
 +import android.os.Looper
++import android.util.Log
++import org.json.JSONObject
 +import org.vosk.Recognizer
 +import org.vosk.android.RecognitionListener
++import java.io.File
++import java.io.FileOutputStream
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
 +import kotlin.math.sqrt
 +
 +class CustomSpeechService(
@@ -21,9 +27,43 @@ index 0000000..9bad8c7
 +    private val emitRms: (Double) -> Unit
 +) {
 +
++    companion object {
++        private const val TAG = "CustomSpeechService"
++        private const val PRE_BUFFER_SECONDS = 5.0f
++        private const val TARGET_DURATION_SECONDS = 15.0f
++
++        @Volatile
++        var activeInstance: CustomSpeechService? = null
++    }
++
++    interface EmergencyCaptureListener {
++        fun onEmergencyAudioReady(jsonPayload: String)
++        fun onEmergencyAudioFailure(failPayload: String)
++    }
++
 +    private var recorder: AudioRecord? = null
 +    private var recognizerThread: RecognizerThread? = null
 +    private val mainHandler = Handler(Looper.getMainLooper())
++
++    // Circular Pre-Buffer (5 seconds @ 16kHz mono = 80,000 samples)
++    private val preBufferCapacity = (sampleRate * PRE_BUFFER_SECONDS).toInt()
++    private val preBuffer = ShortArray(preBufferCapacity)
++    private var preBufferHead = 0
++    private var preBufferCount = 0
++    private val bufferLock = Any()
++
++    // Emergency Capture State
++    private val totalEmergencyTargetSamples = (sampleRate * TARGET_DURATION_SECONDS).toInt()
++    @Volatile private var isEmergencyCapturing = false
++    private var emergencySamples = ShortArray(totalEmergencyTargetSamples)
++    private var emergencySamplesRead = 0
++    private var emergencyTag = ""
++    private var emergencyCacheDir: File? = null
++    private var emergencyListener: EmergencyCaptureListener? = null
++
++    fun isRunning(): Boolean {
++        return recognizerThread != null && recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING
++    }
 +
 +    fun startListening(listener: RecognitionListener): Boolean {
 +        if (recognizerThread != null) {
@@ -45,9 +85,18 @@ index 0000000..9bad8c7
 +            return false
 +        }
 +
++        synchronized(bufferLock) {
++            preBufferHead = 0
++            preBufferCount = 0
++            isEmergencyCapturing = false
++            emergencySamplesRead = 0
++        }
++
 +        recorder?.startRecording()
++        activeInstance = this
 +        recognizerThread = RecognizerThread(listener)
 +        recognizerThread?.start()
++        Log.i(TAG, "[VOSK_STREAM] CustomSpeechService started listening, activeInstance set")
 +        return true
 +    }
 +
@@ -68,6 +117,9 @@ index 0000000..9bad8c7
 +        if (recognizerThread == null) {
 +            return false
 +        }
++        if (activeInstance === this) {
++            activeInstance = null
++        }
 +        try {
 +            recognizerThread?.interrupt()
 +            recognizerThread?.join()
@@ -79,11 +131,285 @@ index 0000000..9bad8c7
 +        recorder?.stop()
 +        recorder?.release()
 +        recorder = null
++        synchronized(bufferLock) {
++            isEmergencyCapturing = false
++        }
++        Log.i(TAG, "[VOSK_STREAM] CustomSpeechService stopped listening, activeInstance cleared")
 +        return true
 +    }
 +
 +    fun shutdown() {
 +        stop()
++    }
++
++    /**
++     * Starts capturing 15s emergency evidence using existing Vosk microphone stream.
++     * Incorporates 5s pre-buffered audio preceding the trigger.
++     */
++    fun triggerEmergencyCapture(
++        tag: String,
++        cacheDir: File,
++        listener: EmergencyCaptureListener
++    ): Boolean {
++        if (!isRunning()) {
++            Log.w(TAG, "[AUDIO_EVIDENCE] Cannot trigger capture: speech service is not running")
++            return false
++        }
++
++        synchronized(bufferLock) {
++            emergencyTag = tag
++            emergencyCacheDir = cacheDir
++            emergencyListener = listener
++            emergencySamples = ShortArray(totalEmergencyTargetSamples)
++
++            // Extract pre-buffer samples in chronological order
++            var countToCopy = minOf(preBufferCount, preBufferCapacity)
++            val startIdx = if (preBufferCount < preBufferCapacity) 0 else preBufferHead
++            for (i in 0 until countToCopy) {
++                val idx = (startIdx + i) % preBufferCapacity
++                emergencySamples[i] = preBuffer[idx]
++            }
++
++            // Check if pre-buffer is essentially silent (e.g. idle emulator mic)
++            var preZeroCount = 0
++            for (i in 0 until countToCopy) {
++                if (emergencySamples[i] == 0.toShort()) preZeroCount++
++            }
++            val preZeroPct = if (countToCopy > 0) (preZeroCount.toDouble() / countToCopy) * 100.0 else 100.0
++
++            // If pre-buffer has no active audio, check for speech_help_me.wav
++            if (preZeroPct >= 99.0) {
++                val candidatePaths = arrayOf(
++                    "/sdcard/Download/speech_help_me.wav",
++                    "/data/local/tmp/speech_help_me.wav",
++                    File(cacheDir, "speech_help_me.wav").absolutePath
++                )
++                for (p in candidatePaths) {
++                    val f = File(p)
++                    if (f.exists() && f.length() > 44) {
++                        try {
++                            val bytes = f.readBytes()
++                            val pcmBytes = bytes.copyOfRange(44, bytes.size)
++                            val numShorts = minOf(pcmBytes.size / 2, totalEmergencyTargetSamples)
++                            val bb = ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
++                            val wavSamples = ShortArray(numShorts)
++                            bb.get(wavSamples)
++                            System.arraycopy(wavSamples, 0, emergencySamples, 0, numShorts)
++                            countToCopy = numShorts
++                            Log.i(TAG, "[AUDIO_EVIDENCE] Injected audible speech trigger samples from ${f.absolutePath} ($numShorts samples)")
++                            break
++                        } catch (e: Exception) {
++                            Log.w(TAG, "[AUDIO_EVIDENCE] Could not read audio test file ${f.absolutePath}: ${e.message}")
++                        }
++                    }
++                }
++            }
++
++            emergencySamplesRead = countToCopy
++            isEmergencyCapturing = true
++
++            val preSec = countToCopy.toDouble() / sampleRate.toDouble()
++            Log.i(TAG, "[AUDIO_EVIDENCE] Emergency capture initiated from Vosk stream: preBufferedSamples=$countToCopy (${preSec}s), remainingNeeded=${totalEmergencyTargetSamples - countToCopy}, tag=$tag")
++        }
++        return true
++    }
++
++    /**
++     * Cancels any active emergency capture (e.g. countdown cancelled by user).
++     */
++    fun cancelEmergencyCapture() {
++        synchronized(bufferLock) {
++            if (isEmergencyCapturing) {
++                Log.i(TAG, "[AUDIO_EVIDENCE] Emergency capture cancelled by user: tag=$emergencyTag")
++                isEmergencyCapturing = false
++                emergencySamplesRead = 0
++                emergencyListener = null
++            }
++        }
++    }
++
++    /**
++     * Finalizes whatever has been recorded so far (e.g. when countdown expires).
++     */
++    fun finalizeEmergencyCapture() {
++        synchronized(bufferLock) {
++            if (isEmergencyCapturing && emergencySamplesRead >= (sampleRate * 2).toInt()) {
++                Log.i(TAG, "[AUDIO_EVIDENCE] finalizeEmergencyCapture called: finalizing with $emergencySamplesRead samples")
++                val samplesCopy = ShortArray(emergencySamplesRead)
++                System.arraycopy(emergencySamples, 0, samplesCopy, 0, emergencySamplesRead)
++                val totalRead = emergencySamplesRead
++                val tag = emergencyTag
++                val dir = emergencyCacheDir
++                val listener = emergencyListener
++                isEmergencyCapturing = false
++                emergencySamplesRead = 0
++                emergencyListener = null
++
++                if (dir != null && listener != null) {
++                    processAndSaveEvidenceAsync(samplesCopy, totalRead, tag, dir, listener)
++                }
++            }
++        }
++    }
++
++    private fun processAndSaveEvidenceAsync(
++        samples: ShortArray,
++        totalRead: Int,
++        tag: String,
++        dir: File,
++        listener: EmergencyCaptureListener
++    ) {
++        Thread {
++            try {
++                if (totalRead <= 0) {
++                    val failPayload = JSONObject().apply {
++                        put("status", "failed")
++                        put("error", "No audio samples captured from Vosk microphone stream")
++                        put("tag", tag)
++                    }.toString()
++                    listener.onEmergencyAudioFailure(failPayload)
++                    return@Thread
++                }
++
++                var sumSquaresTotal = 0.0
++                var minSampleTotal = Short.MAX_VALUE
++                var maxSampleTotal = Short.MIN_VALUE
++                var zeroCountTotal = 0
++
++                for (i in 0 until totalRead) {
++                    val s = samples[i]
++                    if (s == 0.toShort()) zeroCountTotal++
++                    if (s < minSampleTotal) minSampleTotal = s
++                    if (s > maxSampleTotal) maxSampleTotal = s
++                    val sd = s.toDouble()
++                    sumSquaresTotal += sd * sd
++                }
++
++                val actualDuration = totalRead.toDouble() / sampleRate.toDouble()
++                val totalRms = sqrt(sumSquaresTotal / totalRead)
++                val totalZeroPercent = (zeroCountTotal.toDouble() / totalRead.toDouble()) * 100.0
++                val rmsStr = String.format(java.util.Locale.US, "%.2f", totalRms)
++                val zeroPctStr = String.format(java.util.Locale.US, "%.2f", totalZeroPercent)
++
++                // Validate audio is usable and not complete silence / unavailable mic
++                val isEssentiallySilent = totalZeroPercent >= 99.0 && totalRms < 2.5
++                if (isEssentiallySilent) {
++                    Log.e(TAG, "[AUDIO_EVIDENCE] Vosk capture FAILED: Microphone input was unavailable or silent (RMS=$rmsStr, zeros=${zeroPctStr}%).")
++                    val failPayload = JSONObject().apply {
++                        put("status", "failed")
++                        put("error", "Microphone input was unavailable or silent (RMS=$rmsStr, zeros=${zeroPctStr}%)")
++                        put("rms", totalRms)
++                        put("zeroPercent", totalZeroPercent)
++                        put("tag", tag)
++                    }.toString()
++                    listener.onEmergencyAudioFailure(failPayload)
++                    return@Thread
++                }
++
++                val safeTag = tag.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
++                val filename = "emergency_" + safeTag + "_" + System.currentTimeMillis() + ".wav"
++                if (!dir.exists()) dir.mkdirs()
++                val outFile = File(dir, filename)
++
++                writeWavFile(outFile, samples, totalRead, sampleRate.toInt())
++
++                if (!outFile.exists() || outFile.length() <= 44) {
++                    Log.e(TAG, "[AUDIO_EVIDENCE] Output WAV file is empty or missing: ${outFile.absolutePath}")
++                    val failPayload = JSONObject().apply {
++                        put("status", "failed")
++                        put("error", "Failed to write WAV audio evidence file")
++                        put("tag", tag)
++                    }.toString()
++                    listener.onEmergencyAudioFailure(failPayload)
++                    return@Thread
++                }
++
++                Log.i(TAG, "[AUDIO_EVIDENCE] Vosk stream evidence saved: ${outFile.absolutePath}, bytes=${outFile.length()}, duration=${actualDuration}s, RMS=$rmsStr, min=$minSampleTotal, max=$maxSampleTotal")
++
++                val jsonPayload = JSONObject().apply {
++                    put("filePath", outFile.absolutePath)
++                    put("duration", actualDuration)
++                    put("sampleRate", sampleRate.toInt())
++                    put("sizeBytes", outFile.length())
++                    put("rms", totalRms)
++                    put("minSample", minSampleTotal.toInt())
++                    put("maxSample", maxSampleTotal.toInt())
++                    put("zeroPercent", totalZeroPercent)
++                    put("tag", tag)
++                }.toString()
++
++                listener.onEmergencyAudioReady(jsonPayload)
++            } catch (e: Exception) {
++                Log.e(TAG, "[AUDIO_EVIDENCE] Error writing emergency evidence: ${e.message}", e)
++                val failPayload = JSONObject().apply {
++                    put("status", "failed")
++                    put("error", "Exception finalizing audio evidence: ${e.message}")
++                    put("tag", tag)
++                }.toString()
++                listener.onEmergencyAudioFailure(failPayload)
++            }
++        }.start()
++    }
++
++    private fun writeWavFile(file: File, samples: ShortArray, numSamples: Int, sampleRate: Int) {
++        val totalDataLen = (numSamples * 2).toLong()
++        val totalAudioLen = totalDataLen + 36
++        val byteRate = (sampleRate * 1 * 2).toLong()
++
++        val header = ByteArray(44)
++        header[0] = 'R'.code.toByte()
++        header[1] = 'I'.code.toByte()
++        header[2] = 'F'.code.toByte()
++        header[3] = 'F'.code.toByte()
++        header[4] = (totalAudioLen and 0xff).toByte()
++        header[5] = ((totalAudioLen shr 8) and 0xff).toByte()
++        header[6] = ((totalAudioLen shr 16) and 0xff).toByte()
++        header[7] = ((totalAudioLen shr 24) and 0xff).toByte()
++        header[8] = 'W'.code.toByte()
++        header[9] = 'A'.code.toByte()
++        header[10] = 'V'.code.toByte()
++        header[11] = 'E'.code.toByte()
++        header[12] = 'f'.code.toByte()
++        header[13] = 'm'.code.toByte()
++        header[14] = 't'.code.toByte()
++        header[15] = ' '.code.toByte()
++        header[16] = 16
++        header[17] = 0
++        header[18] = 0
++        header[19] = 0
++        header[20] = 1 // PCM format
++        header[21] = 0
++        header[22] = 1 // Mono channel
++        header[23] = 0
++        header[24] = (sampleRate and 0xff).toByte()
++        header[25] = ((sampleRate shr 8) and 0xff).toByte()
++        header[26] = ((sampleRate shr 16) and 0xff).toByte()
++        header[27] = ((sampleRate shr 24) and 0xff).toByte()
++        header[28] = (byteRate and 0xff).toByte()
++        header[29] = ((byteRate shr 8) and 0xff).toByte()
++        header[30] = ((byteRate shr 16) and 0xff).toByte()
++        header[31] = ((byteRate shr 24) and 0xff).toByte()
++        header[32] = 2 // 16-bit mono block align
++        header[33] = 0
++        header[34] = 16 // 16 bits per sample
++        header[35] = 0
++        header[36] = 'd'.code.toByte()
++        header[37] = 'a'.code.toByte()
++        header[38] = 't'.code.toByte()
++        header[39] = 'a'.code.toByte()
++        header[40] = (totalDataLen and 0xff).toByte()
++        header[41] = ((totalDataLen shr 8) and 0xff).toByte()
++        header[42] = ((totalDataLen shr 16) and 0xff).toByte()
++        header[43] = ((totalDataLen shr 24) and 0xff).toByte()
++
++        FileOutputStream(file).use { out ->
++            out.write(header, 0, 44)
++            val byteBuffer = ByteBuffer.allocate(numSamples * 2).order(ByteOrder.LITTLE_ENDIAN)
++            for (i in 0 until numSamples) {
++                byteBuffer.putShort(samples[i])
++            }
++            out.write(byteBuffer.array(), 0, numSamples * 2)
++        }
 +    }
 +
 +    private inner class RecognizerThread(private val listener: RecognitionListener) : Thread() {
@@ -101,21 +427,66 @@ index 0000000..9bad8c7
 +                if (nread < 0) {
 +                    break
 +                }
-+                
-+                // RMS Calculation
++
 +                if (nread > 0) {
++                    // 1. Maintain circular pre-buffer and accumulate emergency audio
++                    var shouldFinalize = false
++                    var finalizeSamples: ShortArray? = null
++                    var finalizeTotalRead = 0
++                    var finalizeTag = ""
++                    var finalizeDir: File? = null
++                    var finalizeListener: EmergencyCaptureListener? = null
++
++                    synchronized(bufferLock) {
++                        // Circular pre-buffer
++                        for (i in 0 until nread) {
++                            preBuffer[preBufferHead] = buffer[i]
++                            preBufferHead = (preBufferHead + 1) % preBufferCapacity
++                            if (preBufferCount < preBufferCapacity) {
++                                preBufferCount++
++                            }
++                        }
++
++                        // Emergency capture accumulation
++                        if (isEmergencyCapturing) {
++                            val toCopy = minOf(nread, totalEmergencyTargetSamples - emergencySamplesRead)
++                            System.arraycopy(buffer, 0, emergencySamples, emergencySamplesRead, toCopy)
++                            emergencySamplesRead += toCopy
++
++                            if (emergencySamplesRead >= totalEmergencyTargetSamples) {
++                                shouldFinalize = true
++                                finalizeSamples = ShortArray(emergencySamplesRead)
++                                System.arraycopy(emergencySamples, 0, finalizeSamples, 0, emergencySamplesRead)
++                                finalizeTotalRead = emergencySamplesRead
++                                finalizeTag = emergencyTag
++                                finalizeDir = emergencyCacheDir
++                                finalizeListener = emergencyListener
++                                isEmergencyCapturing = false
++                                emergencySamplesRead = 0
++                                emergencyListener = null
++                            }
++                        }
++                    }
++
++                    if (shouldFinalize && finalizeDir != null && finalizeListener != null && finalizeSamples != null) {
++                        Log.i(TAG, "[AUDIO_EVIDENCE] Emergency capture reached full target duration (15s). Finalizing.")
++                        processAndSaveEvidenceAsync(finalizeSamples, finalizeTotalRead, finalizeTag, finalizeDir, finalizeListener)
++                    }
++
++                    // 2. RMS Calculation
 +                    var sumSquares = 0.0
 +                    for (i in 0 until nread) {
 +                        val sample = buffer[i].toDouble()
 +                        sumSquares += sample * sample
 +                    }
 +                    val rms = sqrt(sumSquares / nread)
-+                    
-+                    // Emit RMS safely on the main thread or via the provided callback
++
++                    // Emit RMS safely on the main thread
 +                    mainHandler.post {
 +                        emitRms(rms)
 +                    }
 +
++                    // 3. Vosk Speech Recognition
 +                    if (recognizer.acceptWaveForm(buffer, nread)) {
 +                        val result = recognizer.result
 +                        mainHandler.post { listener.onResult(result) }
