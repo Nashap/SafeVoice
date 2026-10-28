@@ -44,6 +44,15 @@ def send_sos_fcm(user, emergency_history, is_contact=False, sender=None):
             title=f"SafeVoice SOS: {sender_name}",
             body=body_text,
         ),
+        android=messaging.AndroidConfig(
+            priority='high',
+            notification=messaging.AndroidNotification(
+                channel_id='fcm_fallback_notification_channel',
+                priority='max',
+                default_sound=True,
+                default_vibrate_timings=True,
+            ),
+        ),
         data={
             'emergency_id': str(emergency_history.id),
             'sender_name': str(sender_name),
@@ -73,7 +82,10 @@ def send_sos_fcm(user, emergency_history, is_contact=False, sender=None):
                     DeviceToken.objects.filter(token=bad_token).delete()
                     print(f"[FCM Dispatch] Deleted unregistered token for user: {user.username}")
                 
-        return (True, "FCM Dispatched") if response.success_count > 0 else (False, "FCM Failed"), "FCM Dispatched"
+        if response.success_count > 0:
+            return True, f"FCM Dispatched to {response.success_count} device(s)"
+        else:
+            return False, f"FCM Failed ({response.failure_count} failure(s))"
     except Exception as e:
         print(f"[FCM Dispatch Exception] Failed to send multicast message: {e}")
         return False, f"FCM Error: {e}"

@@ -1,15 +1,26 @@
 import os
+import logging
+from datetime import timedelta
 from django.db import models
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 from rest_framework import viewsets, generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework_simplejwt.views import TokenObtainPairView
 from .models import User, EmergencyContact, EmergencyHistory, DeviceToken, NotificationAttempt
-from .serializers import UserSerializer, RegisterSerializer, EmergencyContactSerializer, EmergencyHistorySerializer, DeviceTokenSerializer
+from .serializers import (
+    UserSerializer, RegisterSerializer, EmergencyContactSerializer,
+    EmergencyHistorySerializer, DeviceTokenSerializer, CustomTokenObtainPairSerializer
+)
 from .utils import send_sos_fcm
 from .sms_provider import send_emergency_sms
 from .supabase_storage import upload_emergency_audio, create_signed_audio_url
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
 
 class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
@@ -53,6 +64,18 @@ class EmergencyHistoryViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         if not self.request.user.is_authenticated:
             return EmergencyHistory.objects.none()
+
+        # Auto-expire stale pending/preparing/uploading audio uploads older than 90 seconds
+        try:
+            stale_cutoff = timezone.now() - timedelta(seconds=90)
+            EmergencyHistory.objects.filter(
+                audio_status__in=['pending', 'preparing', 'uploading'],
+                timestamp__lt=stale_cutoff
+            ).filter(
+                models.Q(audio_path__isnull=True) | models.Q(audio_path='')
+            ).update(audio_status='failed')
+        except Exception as e:
+            logger.warning(f"[EmergencyHistoryViewSet] Could not auto-expire stale uploads: {e}")
 
         # Senders see their own emergencies
         qs_owner = EmergencyHistory.objects.filter(user=self.request.user)
@@ -194,25 +217,43 @@ class EmergencyHistoryViewSet(viewsets.ModelViewSet):
         if emergency.user != request.user:
             return Response({'error': 'You can only upload audio for your own emergency.'}, status=status.HTTP_403_FORBIDDEN)
 
+        # Idempotency / Duplicate upload prevention:
+        if emergency.audio_status in ('uploaded', 'uploaded_local') and emergency.audio_path:
+            return Response({
+                'status': emergency.audio_status,
+                'storage': 'supabase' if emergency.audio_bucket == 'emergency-audio' else 'local_fallback',
+                'audio_bucket': emergency.audio_bucket,
+                'audio_path': emergency.audio_path,
+                'audio_duration': emergency.audio_duration,
+                'message': 'Audio evidence was already uploaded successfully.'
+            }, status=status.HTTP_200_OK)
+
         audio_file = request.FILES.get('audio') or request.FILES.get('file')
         if not audio_file:
             return Response({'error': 'No audio file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if audio_file.size == 0:
+            return Response({'error': 'Audio file is empty (0 bytes)'}, status=status.HTTP_400_BAD_REQUEST)
 
         if audio_file.size > 10 * 1024 * 1024:
             return Response({'error': 'Audio file exceeds 10MB limit'}, status=status.HTTP_400_BAD_REQUEST)
 
         audio_bytes = audio_file.read()
+        # Verify valid WAV format (RIFF...WAVE header, >= 44 bytes)
+        if len(audio_bytes) < 44 or not (audio_bytes[:4] == b'RIFF' and audio_bytes[8:12] == b'WAVE'):
+            return Response({'error': 'Invalid audio file format. Must be a valid WAV audio file.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            duration = float(request.data.get('duration', 15.0) or 15.0)
+        except (ValueError, TypeError):
+            duration = 15.0
+
         success, object_path, err, storage_type = upload_emergency_audio(
             user_id=request.user.id,
             emergency_id=emergency.id,
             audio_bytes=audio_bytes,
             filename=audio_file.name
         )
-
-        try:
-            duration = float(request.data.get('duration', 15.0) or 15.0)
-        except (ValueError, TypeError):
-            duration = 15.0
 
         if not success:
             emergency.audio_bucket = 'emergency-audio' if storage_type == 'supabase' else 'local_fallback'
