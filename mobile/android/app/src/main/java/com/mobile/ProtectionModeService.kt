@@ -45,6 +45,10 @@ class ProtectionModeService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        @Volatile
+        var currentCountdown: Int = 0
+            internal set
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -118,6 +122,7 @@ class ProtectionModeService : Service() {
     private fun startCountdown(seconds: Int) {
         countdownRunnable?.let { countdownHandler.removeCallbacks(it) }
         remainingCountdown = seconds
+        currentCountdown = seconds
         Log.i(TAG, "[FOREGROUND_SERVICE] Starting emergency countdown with $seconds seconds")
 
         updateNotification(
@@ -129,6 +134,7 @@ class ProtectionModeService : Service() {
         countdownRunnable = object : Runnable {
             override fun run() {
                 remainingCountdown--
+                currentCountdown = remainingCountdown
                 if (remainingCountdown > 0) {
                     updateNotification(
                         "⚠️ Potential Emergency Detected!",
@@ -138,6 +144,7 @@ class ProtectionModeService : Service() {
                     countdownHandler.postDelayed(this, 1000L)
                 } else {
                     remainingCountdown = 0
+                    currentCountdown = 0
                     Log.i(TAG, "[FOREGROUND_SERVICE] Emergency countdown finished! Emitting onCountdownFinished")
                     updateNotification(
                         "🚨 Emergency SOS Dispatched",
@@ -155,6 +162,7 @@ class ProtectionModeService : Service() {
         countdownRunnable?.let { countdownHandler.removeCallbacks(it) }
         countdownRunnable = null
         remainingCountdown = 0
+        currentCountdown = 0
         updateNotification(
             "SafeVoice Protection Active",
             "Listening for emergency triggers..."
@@ -206,6 +214,7 @@ class ProtectionModeService : Service() {
         countdownRunnable?.let { countdownHandler.removeCallbacks(it) }
         countdownRunnable = null
         remainingCountdown = 0
+        currentCountdown = 0
         releaseWakeLock()
 
         // Safely stop Vosk microphone stream if still active
@@ -345,6 +354,11 @@ class ProtectionModeService : Service() {
         } catch (e: Exception) {
             Log.e(TAG, "[FOREGROUND_SERVICE] Error in simulateBackgroundTrigger: ${e.message}")
         }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.i(TAG, "[FOREGROUND_SERVICE] onTaskRemoved: ProtectionModeService remains active in background.")
     }
 
     override fun onDestroy() {

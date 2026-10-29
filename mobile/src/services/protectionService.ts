@@ -65,6 +65,36 @@ class ProtectionService {
   }
 
   /**
+   * Retrieves comprehensive native status: service running, mic recording, countdown.
+   */
+  async getProtectionStatus(): Promise<{
+    serviceRunning: boolean;
+    micRecording: boolean;
+    countdownSeconds: number;
+  }> {
+    if (Platform.OS !== 'android') {
+      return { serviceRunning: false, micRecording: false, countdownSeconds: 0 };
+    }
+
+    try {
+      const module = NativeModules.ProtectionServiceModule;
+      if (module && typeof module.getProtectionStatus === 'function') {
+        const status = await module.getProtectionStatus();
+        return {
+          serviceRunning: !!status?.serviceRunning,
+          micRecording: !!status?.micRecording,
+          countdownSeconds: status?.countdownSeconds || 0,
+        };
+      }
+      const running = await this.isServiceRunning();
+      return { serviceRunning: running, micRecording: running, countdownSeconds: 0 };
+    } catch (e: any) {
+      console.warn('[PROTECTION_SERVICE] Failed to get protection status:', e?.message || e);
+      return { serviceRunning: false, micRecording: false, countdownSeconds: 0 };
+    }
+  }
+
+  /**
    * Updates notification content (e.g. countdown or SOS dispatched alerts).
    */
   async updateStatus(title: string, message: string): Promise<boolean> {

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { View, Text, StyleSheet, PermissionsAndroid, Platform, Alert, ScrollView, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, Alert, ScrollView, TouchableOpacity } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import Header from '../components/Header';
 import Button from '../components/Button';
@@ -12,7 +12,8 @@ export default function ProtectionModeScreen() {
   const navigation = useNavigation<any>();
   const { 
     isProtectionActive, 
-    voskState,
+    listeningState,
+    listeningError,
     recognizedText,
     detectedKeywords,
     keywordCount,
@@ -31,34 +32,8 @@ export default function ProtectionModeScreen() {
 
   const [isToggling, setIsToggling] = useState(false);
 
-  const requestMicrophonePermission = async () => {
-    if (Platform.OS === 'android') {
-      try {
-        const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
-        if (hasPermission) {
-          return true;
-        }
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-          {
-            title: 'Microphone Permission',
-            message: 'SafeVoice needs access to your microphone for emergency voice monitoring.',
-            buttonNeutral: 'Ask Me Later',
-            buttonNegative: 'Cancel',
-            buttonPositive: 'OK',
-          },
-        );
-        return granted === PermissionsAndroid.RESULTS.GRANTED;
-      } catch (err) {
-        console.warn(err);
-        return false;
-      }
-    }
-    return true;
-  };
-
   const handleToggle = async () => {
-    if (isToggling || isSubmittingAlert) return;
+    if (isToggling || isSubmittingAlert || listeningState === 'starting' || listeningState === 'stopping') return;
     setIsToggling(true);
 
     try {
@@ -72,19 +47,56 @@ export default function ProtectionModeScreen() {
     }
   };
 
-  // Determine user-friendly state string
-  let currentStatusDisplay = 'Inactive';
-  if (isProtectionActive) {
-    if (decision === 'Potential Emergency' || countdown !== null) {
-      currentStatusDisplay = 'Trigger Detected!';
-    } else if (isSubmittingAlert) {
-      currentStatusDisplay = 'Sending Alert...';
-    } else if (decision === 'Confirmed') {
-      currentStatusDisplay = 'Alert Accepted';
-    } else if (voskState === 'listening') {
-      currentStatusDisplay = 'Listening...';
-    } else {
-      currentStatusDisplay = voskState;
+  // Determine user-friendly state strings based on conceptual lifecycle states
+  let currentStatusTitle = 'Protection Inactive';
+  let currentStatusSubtitle = 'Offline voice monitoring is turned off';
+  let indicatorColor = '#9ca3af';
+
+  if (decision === 'Potential Emergency' || countdown !== null) {
+    currentStatusTitle = 'POTENTIAL EMERGENCY';
+    currentStatusSubtitle = 'Emergency trigger detected! SOS countdown active';
+    indicatorColor = Colors.warning;
+  } else if (decision === 'Confirmed') {
+    currentStatusTitle = 'EMERGENCY CONFIRMED';
+    currentStatusSubtitle = 'SOS alert dispatched to emergency contacts';
+    indicatorColor = Colors.error;
+  } else if (isSubmittingAlert) {
+    currentStatusTitle = 'DISPATCHING ALERT...';
+    currentStatusSubtitle = 'Uploading location and notifying emergency contacts';
+    indicatorColor = Colors.warning;
+  } else {
+    switch (listeningState) {
+      case 'starting':
+        currentStatusTitle = 'Starting Protection...';
+        currentStatusSubtitle = 'Initializing microphone and background service';
+        indicatorColor = Colors.warning;
+        break;
+      case 'listening':
+        currentStatusTitle = 'Protection Active — Listening';
+        currentStatusSubtitle = 'Microphone listening offline for emergency keywords';
+        indicatorColor = Colors.success;
+        break;
+      case 'recovering':
+        currentStatusTitle = 'Recovering Listening...';
+        currentStatusSubtitle = listeningError || 'Re-establishing microphone monitoring session...';
+        indicatorColor = Colors.warning;
+        break;
+      case 'stopping':
+        currentStatusTitle = 'Stopping Protection...';
+        currentStatusSubtitle = 'Releasing microphone and stopping background service';
+        indicatorColor = '#9ca3af';
+        break;
+      case 'error':
+        currentStatusTitle = 'Listening Error';
+        currentStatusSubtitle = listeningError || 'Voice monitoring stopped unexpectedly';
+        indicatorColor = Colors.error;
+        break;
+      case 'disabled':
+      default:
+        currentStatusTitle = 'Protection Inactive';
+        currentStatusSubtitle = 'Turn on to enable offline emergency voice detection';
+        indicatorColor = '#9ca3af';
+        break;
     }
   }
 
@@ -121,22 +133,31 @@ export default function ProtectionModeScreen() {
           </View>
         )}
 
+        {listeningState === 'error' && (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorBoxTitle}>⚠️ Listening Stopped</Text>
+            <Text style={styles.errorBoxText}>{listeningError || 'Microphone pipeline was interrupted.'}</Text>
+            <Button 
+              title="RETRY PROTECTION" 
+              onPress={() => startProtectionMode()} 
+              variant="primary" 
+              style={{ marginTop: 8 }}
+            />
+          </View>
+        )}
+
         <View style={styles.statusContainer}>
           <View 
             style={[
               styles.indicator, 
-              { 
-                backgroundColor: decision === 'Potential Emergency'
-                  ? Colors.warning 
-                  : (isProtectionActive ? Colors.success : Colors.error) 
-              }
+              { backgroundColor: indicatorColor }
             ]} 
           />
           <Text style={styles.statusText}>
-            {isProtectionActive ? 'Protection Active' : 'Protection Inactive'}
+            {currentStatusTitle}
           </Text>
-          <Text style={[styles.stateText, decision === 'Potential Emergency' && { color: Colors.warning }]}>
-            Status: {currentStatusDisplay}
+          <Text style={[styles.stateText, (decision === 'Potential Emergency' || listeningState === 'recovering') && { color: Colors.warning }]}>
+            {currentStatusSubtitle}
           </Text>
         </View>
 
@@ -224,11 +245,17 @@ export default function ProtectionModeScreen() {
           title={
             isToggling 
               ? "Updating..." 
+              : listeningState === 'starting'
+              ? "Starting Protection..."
+              : listeningState === 'stopping'
+              ? "Stopping Protection..."
+              : listeningState === 'error'
+              ? "Retry Protection Mode"
               : (isProtectionActive ? "Stop Protection Mode" : "Activate Protection Mode")
           }
           onPress={handleToggle}
-          variant={isProtectionActive ? 'secondary' : 'primary'}
-          disabled={isToggling || isSubmittingAlert}
+          variant={isProtectionActive ? 'secondary' : (listeningState === 'error' ? 'danger' : 'primary')}
+          disabled={isToggling || isSubmittingAlert || listeningState === 'starting' || listeningState === 'stopping'}
         />
         <View style={{ height: 16 }} />
         <Button 
@@ -412,5 +439,27 @@ const styles = StyleSheet.create({
     ...Typography.body1,
     color: '#1d4ed8',
     fontWeight: 'bold',
+  },
+  errorBox: {
+    backgroundColor: '#fef2f2',
+    padding: 16,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: '#ef4444',
+    width: '100%',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  errorBoxTitle: {
+    ...Typography.h3,
+    color: '#b91c1c',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  errorBoxText: {
+    ...Typography.body2,
+    color: '#7f1d1d',
+    textAlign: 'center',
+    marginBottom: 8,
   },
 });

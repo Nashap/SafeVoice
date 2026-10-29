@@ -59,4 +59,22 @@ export const StorageService = {
       return null;
     }
   },
+
+  async saveProtectionEnabled(username: string, enabled: boolean): Promise<void> {
+    try {
+      await AsyncStorage.setItem(`@safevoice/protection_enabled_${username}`, enabled ? 'true' : 'false');
+    } catch (e) {
+      console.error('[SafeVoiceProtection] Failed to save protection enabled state', e);
+    }
+  },
+
+  async loadProtectionEnabled(username: string): Promise<boolean> {
+    try {
+      const val = await AsyncStorage.getItem(`@safevoice/protection_enabled_${username}`);
+      return val === 'true';
+    } catch (e) {
+      console.error('[SafeVoiceProtection] Failed to load protection enabled state', e);
+      return false;
+    }
+  },
 };

@@ -122,14 +122,24 @@ index 0000000..f6b61df
 +        }
 +        try {
 +            recognizerThread?.interrupt()
-+            recognizerThread?.join()
++            recognizerThread?.join(1500)
 +        } catch (e: InterruptedException) {
 +            Thread.currentThread().interrupt()
 +        }
 +        recognizerThread = null
 +
-+        recorder?.stop()
-+        recorder?.release()
++        try {
++            if (recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
++                recorder?.stop()
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "[VOSK_STREAM] Error stopping recorder: ${e.message}")
++        }
++        try {
++            recorder?.release()
++        } catch (e: Exception) {
++            Log.w(TAG, "[VOSK_STREAM] Error releasing recorder: ${e.message}")
++        }
 +        recorder = null
 +        synchronized(bufferLock) {
 +            isEmergencyCapturing = false
@@ -422,9 +432,14 @@ index 0000000..f6b61df
 +
 +        override fun run() {
 +            val buffer = ShortArray(bufferSize)
++            var readErrorOccurred = false
++            var readErrorCode = 0
 +            while (!isInterrupted) {
 +                val nread = recorder?.read(buffer, 0, buffer.size) ?: -1
 +                if (nread < 0) {
++                    readErrorOccurred = true
++                    readErrorCode = nread
++                    Log.e(TAG, "[VOSK_STREAM] AudioRecord.read error: $nread")
 +                    break
 +                }
 +
@@ -501,7 +516,14 @@ index 0000000..f6b61df
 +                }
 +            }
 +
-+            if (!timeout) {
++            if (readErrorOccurred) {
++                if (activeInstance === this@CustomSpeechService) {
++                    activeInstance = null
++                }
++                mainHandler.post {
++                    listener.onError(java.io.IOException("Microphone read error (code $readErrorCode)"))
++                }
++            } else if (!timeout) {
 +                val finalResult = recognizer.finalResult
 +                mainHandler.post { listener.onFinalResult(finalResult) }
 +            }
@@ -521,6 +543,25 @@ index c2c4d64..19903a4 100644
    private var context: ReactApplicationContext? = reactContext
    private var recognizer: Recognizer? = null
    private var sampleRate = 16000.0f
+@@ -62,6 +62,7 @@ class VoskModule(reactContext: ReactApplicationContext) :
+   }
+ 
+   override fun onError(e: Exception) {
++    cleanRecognizer()
+     emitOnError(e.toString())
+   }
+ 
+@@ -137,8 +137,8 @@ class VoskModule(reactContext: ReactApplicationContext) :
+       return
+     }
+     if (speechService != null) {
+-      promise.reject(IOException("Recognizer is already in use"))
+-      return
++      Log.w(NAME, "[VOSK] Recognizer was in use; resetting previous session before restart")
++      cleanRecognizer()
+     }
+     try {
+       recognizer =
 @@ -146,7 +146,9 @@ class VoskModule(reactContext: ReactApplicationContext) :
                } else {
                  Recognizer(model, sampleRate)

@@ -1,13 +1,13 @@
 import React, { createContext, useState, useContext, ReactNode, useEffect, useRef } from 'react';
 import api from '../services/api';
-import { Alert, DeviceEventEmitter, AppState, PermissionsAndroid, Platform } from 'react-native';
+import { Alert, DeviceEventEmitter, AppState } from 'react-native';
 import { useAuth } from './AuthContext';
 import { StorageService } from '../services/storage';
 import { voskService } from '../services/voskService';
-import { requestLocationPermission, getCurrentLocation, getReadableLocation, LocationData } from '../services/locationService';
+import { requestLocationPermission, getReadableLocation, LocationData } from '../services/locationService';
 import { audioEvidenceService } from '../services/audioEvidenceService';
 import { protectionService } from '../services/protectionService';
-import { requestNotificationPermission } from '../services/notificationService';
+import { listeningLifecycleManager, ListeningLifecycleState } from '../services/listeningLifecycleManager';
 
 export interface Contact {
   id: string;
@@ -37,6 +37,8 @@ interface SafeVoiceContextType {
   setCustomTrigger: (phrase: string) => Promise<boolean>;
 
   isProtectionActive: boolean;
+  listeningState: ListeningLifecycleState;
+  listeningError: string | null;
   voskState: string;
   recognizedText: string;
   detectedKeywords: string[];
@@ -71,6 +73,8 @@ const defaultState: SafeVoiceContextType = {
   setCustomTrigger: async () => false,
 
   isProtectionActive: false,
+  listeningState: 'disabled',
+  listeningError: null,
   voskState: 'stopped',
   recognizedText: '',
   detectedKeywords: [],
@@ -104,6 +108,8 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
 
   // Monitoring State
   const [isProtectionActive, setIsProtectionActive] = useState(false);
+  const [listeningState, setListeningState] = useState<ListeningLifecycleState>('disabled');
+  const [listeningError, setListeningError] = useState<string | null>(null);
   const [voskState, setVoskState] = useState<string>('stopped');
   const [recognizedText, setRecognizedText] = useState<string>('');
   const [detectedKeywords, setDetectedKeywords] = useState<string[]>([]);
@@ -142,6 +148,29 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     voskService.customTrigger = customTrigger;
   }, [customTrigger]);
+
+  // Subscribe to centralized listening lifecycle manager (Single Source of Truth)
+  useEffect(() => {
+    const unsub = listeningLifecycleManager.subscribe((status) => {
+      setIsProtectionActive(status.isProtectionActive);
+      setListeningState(status.state);
+      setListeningError(status.error);
+      if (!status.isProtectionActive) {
+        setRms(0);
+        setCountdown(null);
+        setDecision('Normal');
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Inform lifecycle manager when an emergency workflow is running
+  // During active emergencies, watchdog restarts are held to preserve recording and alert dispatch
+  useEffect(() => {
+    const isEmerg = countdown !== null || isSubmittingAlert || decision !== 'Normal';
+    listeningLifecycleManager.setEmergencyActive(isEmerg);
+  }, [countdown, isSubmittingAlert, decision]);
 
   // Handle native emergency audio clip completion or failure
   useEffect(() => {
@@ -209,20 +238,17 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     const unsub = protectionService.subscribeStateChanges({
       onStarted: () => {
-        setIsProtectionActive(true);
+        console.log('[SafeVoiceContext] Native service onStarted confirmed');
       },
       onStopped: () => {
-        setIsProtectionActive(false);
-        setRms(0);
-        setCountdown(null);
-        setDecision('Normal');
+        console.log('[SafeVoiceContext] Native foreground service stopped from notification or OS');
+        if (listeningLifecycleManager.isProtectionActive()) {
+          listeningLifecycleManager.stopProtection('native notification action');
+        }
       },
       onError: (err) => {
-        setIsProtectionActive(false);
-        setRms(0);
-        setCountdown(null);
-        setDecision('Normal');
-        Alert.alert('Protection Mode Alert', err || 'Background voice monitoring stopped.');
+        console.warn('[SafeVoiceContext] Native foreground service reported error:', err);
+        listeningLifecycleManager.triggerRecovery(err || 'Native service stopped');
       },
       onCountdownTick: (remaining: number) => {
         setCountdown(remaining);
@@ -262,35 +288,27 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     return () => unsub();
   }, []);
 
-  // Sync actual native service running state on mount and when app resumes from background
+  // When app resumes from background, verify native service health
   useEffect(() => {
-    const syncNativeState = async () => {
-      try {
-        const running = await protectionService.isServiceRunning();
-        console.log(`[SafeVoiceContext] Syncing native service state: running=${running}, isProtectionActive=${isProtectionActive}`);
-        if (!running && isProtectionActive) {
-          setIsProtectionActive(false);
-          setRms(0);
-        } else if (running && !isProtectionActive) {
-          setIsProtectionActive(true);
+    const appStateSub = AppState.addEventListener('change', async (nextAppState) => {
+      if (nextAppState === 'active' && username) {
+        try {
+          const status = await protectionService.getProtectionStatus();
+          console.log(`[SafeVoiceContext] App active check: native running=${status.serviceRunning}, micRecording=${status.micRecording}, lifecycleState=${listeningLifecycleManager.getState()}`);
+          if (listeningLifecycleManager.isProtectionActive() && !status.serviceRunning) {
+            console.warn('[SafeVoiceContext] App resumed but native service died in background. Triggering recovery...');
+            listeningLifecycleManager.triggerRecovery('Native service killed while in background');
+          }
+        } catch (e) {
+          console.warn('[SafeVoiceContext] Error querying native status on resume:', e);
         }
-      } catch (e) {
-        console.warn('[SafeVoiceContext] Error syncing native service state:', e);
-      }
-    };
-
-    syncNativeState();
-
-    const appStateSub = AppState.addEventListener('change', (nextAppState) => {
-      if (nextAppState === 'active') {
-        syncNativeState();
       }
     });
 
     return () => {
       appStateSub.remove();
     };
-  }, [isProtectionActive]);
+  }, [username]);
 
   useEffect(() => {
     console.log(`[SafeVoiceContext] useEffect triggered. isAuthenticated: ${isAuthenticated}, username available: ${!!username}`);
@@ -300,6 +318,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
       setProfileState({ name: '', phone: '' });
       setContacts([]);
       setIsLoaded(false);
+      listeningLifecycleManager.stopProtection('user logged out');
       return;
     }
 
@@ -329,6 +348,9 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         console.log('[SafeVoiceContext] Setting isLoaded to true');
         setIsLoaded(true);
       }
+      
+      // Initialize lifecycle manager with restored settings & native status
+      await listeningLifecycleManager.initialize(username);
       
       try {
         console.log('[SafeVoiceContext] Fetching backend profile (/users/)');
@@ -672,46 +694,7 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     return () => clearTimeout(timer);
   }, [countdown, decision, isProtectionActive]);
 
-  const requestMicrophonePermission = async (): Promise<boolean> => {
-    if (Platform.OS === 'android') {
-      try {
-        const hasPermission = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
-        if (hasPermission) return true;
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-          {
-            title: 'Microphone Permission',
-            message: 'SafeVoice requires microphone access for offline voice monitoring.',
-            buttonPositive: 'OK',
-            buttonNegative: 'Cancel',
-          }
-        );
-        return granted === PermissionsAndroid.RESULTS.GRANTED;
-      } catch (e) {
-        console.warn('[SafeVoiceContext] Error requesting RECORD_AUDIO permission:', e);
-        return false;
-      }
-    }
-    return true;
-  };
-
   const startProtectionMode = async (): Promise<boolean> => {
-    if (isProtectionActive) return true;
-
-    // 1. Ensure notification permission is requested/granted (Android 13+)
-    await requestNotificationPermission();
-
-    // 2. Ensure microphone permission is granted
-    const hasMicPermission = await requestMicrophonePermission();
-    if (!hasMicPermission) {
-      setIsProtectionActive(false);
-      Alert.alert(
-        'Microphone Permission Required',
-        'SafeVoice requires microphone access to monitor for emergency keywords. Please grant microphone permission.'
-      );
-      return false;
-    }
-    
     setKeywordCount(0);
     setRepetitionFactor(0);
     setEmergencyScore(0);
@@ -722,47 +705,27 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     setDetectedKeywords([]);
     setRecognizedText('');
     setRms(0);
-    
-    try {
-      // 3. Start native Android Foreground Service with type microphone FIRST
-      // This elevates process priority and grants background microphone recording access under Android 14+
-      await protectionService.startForegroundService(
-        'SafeVoice Protection Active',
-        'Listening for emergency triggers...'
-      );
 
-      // 4. Start Vosk offline speech recognition
-      const started = await voskService.startListening();
-      if (!started) {
-        await protectionService.stopForegroundService();
-        setIsProtectionActive(false);
-        Alert.alert('Microphone Error', 'Failed to start microphone or speech recognition service. Please check microphone permissions and try again.');
-        return false;
-      }
-      setIsProtectionActive(true);
-      return true;
-    } catch (err: any) {
-      console.error('Failed to start protection mode', err);
-      await protectionService.stopForegroundService();
-      setIsProtectionActive(false);
-      Alert.alert('Microphone Error', err?.message || 'Unable to initialize audio capture. Please try again.');
-      return false;
+    const started = await listeningLifecycleManager.startProtection();
+    if (!started) {
+      const err = listeningLifecycleManager.getStatus().error;
+      Alert.alert('Protection Mode', err || 'Unable to initialize microphone protection. Please check permissions.');
     }
+    return started;
   };
 
   const stopProtectionMode = async () => {
     protectionService.cancelEmergencyCountdown();
-    setIsProtectionActive(false);
     setRms(0);
     setCountdown(null);
     setDecision('Normal');
-    await voskService.stopListening();
-    await protectionService.stopForegroundService();
+    await listeningLifecycleManager.stopProtection('user requested');
   };
 
   const cancelEmergency = () => {
     protectionService.cancelEmergencyCountdown();
     audioEvidenceService.cancelCapture();
+    listeningLifecycleManager.setEmergencyActive(false);
     setCountdown(null);
     setDecision('Normal');
     setLocation(null);
@@ -773,11 +736,11 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
     idempotencyKeyRef.current = null;
     activeEmergencyIdRef.current = null;
     latestAudioClipRef.current = null;
-    if (isProtectionActive) {
+    if (listeningLifecycleManager.isProtectionActive()) {
       protectionService.updateStatus(
         'SafeVoice Protection Active',
         'Listening for emergency triggers...'
-      );
+      ).catch(() => {});
     }
     console.log('[DECISION_DEBUG] Emergency cancelled by user.');
   };
@@ -899,6 +862,8 @@ export const SafeVoiceProvider = ({ children }: { children: ReactNode }) => {
         setCustomTrigger,
         
         isProtectionActive,
+        listeningState,
+        listeningError,
         voskState,
         recognizedText,
         detectedKeywords,

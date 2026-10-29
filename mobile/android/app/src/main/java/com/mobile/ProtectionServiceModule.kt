@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
@@ -90,6 +91,16 @@ class ProtectionServiceModule(private val reactContext: ReactApplicationContext)
     fun isProtectionServiceRunning(promise: Promise) {
         val running = ProtectionModeService.isRunning
         promise.resolve(running)
+    }
+
+    @ReactMethod
+    fun getProtectionStatus(promise: Promise) {
+        val map = Arguments.createMap().apply {
+            putBoolean("serviceRunning", ProtectionModeService.isRunning)
+            putBoolean("micRecording", com.vosk.CustomSpeechService.activeInstance?.isRunning() ?: false)
+            putInt("countdownSeconds", ProtectionModeService.currentCountdown)
+        }
+        promise.resolve(map)
     }
 
     @ReactMethod

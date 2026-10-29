@@ -10,7 +10,45 @@ import { useSafeVoice } from '../context/SafeVoiceContext';
 
 export default function HomeScreen() {
   const navigation = useNavigation<NavigationProps>();
-  const { isProtectionActive, profile } = useSafeVoice();
+  const { isProtectionActive, listeningState, listeningError, profile } = useSafeVoice();
+
+  let statusLabel = 'INACTIVE';
+  let statusColor = Colors.error;
+  let statusDesc = 'Turn on to enable offline emergency voice detection';
+
+  switch (listeningState) {
+    case 'starting':
+      statusLabel = 'STARTING...';
+      statusColor = Colors.warning;
+      statusDesc = 'Initializing microphone and background service...';
+      break;
+    case 'listening':
+      statusLabel = 'ACTIVE';
+      statusColor = Colors.success;
+      statusDesc = 'Voice monitoring is active and listening for emergency triggers';
+      break;
+    case 'recovering':
+      statusLabel = 'RECOVERING...';
+      statusColor = Colors.warning;
+      statusDesc = listeningError || 'Re-establishing microphone monitoring...';
+      break;
+    case 'stopping':
+      statusLabel = 'STOPPING...';
+      statusColor = Colors.textSecondary;
+      statusDesc = 'Stopping voice monitoring and releasing audio resources...';
+      break;
+    case 'error':
+      statusLabel = 'ERROR';
+      statusColor = Colors.error;
+      statusDesc = listeningError || 'Listening stopped unexpectedly. Tap to check protection.';
+      break;
+    case 'disabled':
+    default:
+      statusLabel = 'INACTIVE';
+      statusColor = Colors.error;
+      statusDesc = 'Turn on to enable offline emergency voice detection';
+      break;
+  }
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
@@ -21,17 +59,23 @@ export default function HomeScreen() {
 
       <Card style={styles.statusCard}>
         <Text style={styles.statusTitle}>Protection Status</Text>
-        <Text style={[styles.statusValue, { color: isProtectionActive ? Colors.success : Colors.error }]}>
-          {isProtectionActive ? 'ACTIVE' : 'INACTIVE'}
+        <Text style={[styles.statusValue, { color: statusColor }]}>
+          {statusLabel}
         </Text>
         <Text style={styles.statusDesc}>
-          {isProtectionActive 
-            ? 'Voice monitoring is running offline' 
-            : 'Turn on to enable offline emergency voice detection'}
+          {statusDesc}
         </Text>
         
         <Button 
-          title={isProtectionActive ? "Stop Protection" : "Activate Protection Mode"} 
+          title={
+            listeningState === 'starting'
+              ? "Starting..."
+              : listeningState === 'stopping'
+              ? "Stopping..."
+              : isProtectionActive
+              ? "Stop Protection"
+              : "Activate Protection Mode"
+          } 
           onPress={() => navigation.navigate('ProtectionMode')} 
           variant={isProtectionActive ? 'secondary' : 'primary'}
           style={styles.actionBtn}

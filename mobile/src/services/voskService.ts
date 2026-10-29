@@ -1,18 +1,18 @@
-import Vosk from 'react-native-vosk';
 import { loadModel, start, stop, unload, onPartialResult, onResult, onFinalResult, onError } from 'react-native-vosk';
 import { detectKeywords, KeywordDetectionResult } from './keywordDetector';
-import { Alert, EventSubscription, DeviceEventEmitter, NativeModules } from 'react-native';
+import { EventSubscription, DeviceEventEmitter, NativeModules } from 'react-native';
 
 class VoskService {
   private isLoaded: boolean = false;
   private isListening: boolean = false;
   
-  // Callbacks for UI updates
+  // Callbacks for UI and lifecycle monitoring
   public onPartialText?: (text: string) => void;
   public onFinalText?: (text: string, detectionResult: KeywordDetectionResult) => void;
   public onVoskError?: (error: string) => void;
   public onRmsValue?: (rms: number) => void;
   public onStateChange?: (state: 'loading' | 'ready' | 'listening' | 'error' | 'stopped') => void;
+  public onAudioFrame?: () => void;
   public customTrigger?: string;
 
   private currentK: number = 0;
@@ -29,17 +29,23 @@ class VoskService {
   private lastProcessedResultText: string = "";
   private lastProcessedResultTime: number = 0;
 
+  public getIsListening(): boolean {
+    return this.isListening;
+  }
+
   async initialize() {
     if (this.isLoaded) return;
     
     try {
       this.onStateChange?.('loading');
+      console.log('[SafeVoiceListening] Loading Vosk acoustic model model-en...');
       await loadModel('model-en');
       this.isLoaded = true;
       this.onStateChange?.('ready');
       this.setupListeners();
+      console.log('[SafeVoiceListening] Vosk acoustic model loaded successfully');
     } catch (e) {
-      console.error('Failed to load Vosk model', e);
+      console.error('[SafeVoiceListening] Failed to load Vosk model', e);
       this.onStateChange?.('error');
       this.onVoskError?.('Failed to load speech recognition model. Make sure the model exists in assets.');
       throw e;
@@ -59,13 +65,14 @@ class VoskService {
     this.rmsSub = DeviceEventEmitter.addListener('onRms', (rmsStr: string) => {
       const rms = parseFloat(rmsStr);
       if (!isNaN(rms)) {
-        console.log(`[RMS] value: ${rms.toFixed(2)}`);
+        this.onAudioFrame?.();
         this.onRmsValue?.(rms);
       }
     });
 
     const handlePartial = (res: string) => {
       try {
+        this.onAudioFrame?.();
         let text = '';
         if (typeof res === 'string') {
           try {
@@ -81,7 +88,7 @@ class VoskService {
         if (text) {
           this.onPartialText?.(text);
         }
-      } catch (e) {
+      } catch {
         if (typeof res === 'string' && res.trim().length > 0) {
           this.onPartialText?.(res.trim());
         }
@@ -90,6 +97,7 @@ class VoskService {
 
     const handleResult = (res: string) => {
       try {
+        this.onAudioFrame?.();
         let text = '';
         if (typeof res === 'string') {
           try {
@@ -113,16 +121,16 @@ class VoskService {
           this.lastProcessedResultText = normalized;
           this.lastProcessedResultTime = now;
 
-          console.log(`[KEYWORD_DEBUG] recognized utterance: "${text}"`);
+          console.log(`[SafeVoiceListening] Recognized utterance: "${text}"`);
           const detection = detectKeywords(text, this.customTrigger);
           if (detection.count > 0) {
             this.currentK += detection.count;
-            console.log(`[KEYWORD_DEBUG] incrementing K: ${detection.count} (Total K = ${this.currentK}, isCustom: ${detection.isCustomTrigger})`);
+            console.log(`[SafeVoiceListening] Detected emergency keyword(s): count=${detection.count}, totalK=${this.currentK}, custom=${detection.isCustomTrigger}`);
           }
           this.onFinalText?.(text, detection);
         }
       } catch (e) {
-        console.warn('[VOSK_RESULT_ERR]', e);
+        console.warn('[SafeVoiceListening] Error processing speech result:', e);
       }
     };
 
@@ -135,7 +143,7 @@ class VoskService {
     this.deviceFinalSub = DeviceEventEmitter.addListener('onFinalResult', handleResult);
 
     this.errorSub = onError((e: any) => {
-      console.error('Vosk Error:', e);
+      console.error('[SafeVoiceListening] Native speech recognition error:', e);
       this.isListening = false;
       this.onVoskError?.(String(e));
       this.onStateChange?.('error');
@@ -146,28 +154,31 @@ class VoskService {
     try {
       const VoskModule = NativeModules.Vosk;
       if (VoskModule && VoskModule.feedAudioFile) {
-        console.log(`[VOSK_FEED] Feeding audio file to recognizer: ${filePath}`);
+        console.log(`[SafeVoiceListening] Feeding audio file to recognizer: ${filePath}`);
         await VoskModule.feedAudioFile(filePath);
         return true;
       }
-      console.log(`[VOSK_FEED] Triggering spoken utterance simulation for: ${filePath}`);
+      console.log(`[SafeVoiceListening] Simulating spoken utterance for test audio: ${filePath}`);
       const triggerPhrase = this.customTrigger || 'help me';
       const detection = detectKeywords(triggerPhrase, this.customTrigger);
       this.onFinalText?.(triggerPhrase, detection);
       return true;
     } catch (e) {
-      console.warn('[VOSK_FEED_ERR]', e);
+      console.warn('[SafeVoiceListening] Error feeding audio file:', e);
       return false;
     }
   }
 
   async startListening(): Promise<boolean> {
-    console.log('[MIC_LIFECYCLE] voskService.startListening() called');
+    console.log('[SafeVoiceListening] voskService.startListening() requested');
     if (!this.isLoaded) {
       await this.initialize();
     }
     
-    if (this.isListening) return true;
+    if (this.isListening) {
+      console.log('[SafeVoiceListening] voskService is already listening. Resolving true.');
+      return true;
+    }
 
     try {
       this.currentK = 0;
@@ -176,31 +187,36 @@ class VoskService {
       await start();
       this.isListening = true;
       this.onStateChange?.('listening');
+      console.log('[SafeVoiceListening] Microphone stream successfully started');
       return true;
-    } catch (e) {
-      console.error('Failed to start listening', e);
+    } catch (e: any) {
+      console.error('[SafeVoiceListening] Failed to start microphone stream:', e);
       this.isListening = false;
-      this.onVoskError?.('Could not start microphone stream.');
+      this.onVoskError?.(e?.message || 'Could not start microphone stream.');
       this.onStateChange?.('error');
       return false;
     }
   }
 
-  async stopListening() {
-    console.log('[MIC_LIFECYCLE] voskService.stopListening() called');
+  async stopListening(): Promise<boolean> {
+    console.log('[SafeVoiceListening] voskService.stopListening() requested');
     this.isListening = false;
     this.lastProcessedResultText = "";
     this.lastProcessedResultTime = 0;
     try {
-      stop();
+      await stop();
       this.onStateChange?.('stopped');
-    } catch (e) {
-      console.error('Failed to stop Vosk', e);
+      console.log('[SafeVoiceListening] Microphone stream successfully stopped');
+      return true;
+    } catch (e: any) {
+      console.warn('[SafeVoiceListening] Exception stopping Vosk:', e?.message || e);
+      this.onStateChange?.('stopped');
+      return false;
     }
   }
 
   unloadService() {
-    console.log('[MIC_LIFECYCLE] voskService.unloadService() called');
+    console.log('[SafeVoiceListening] voskService.unloadService() called');
     try {
       this.partialSub?.remove();
       this.resultSub?.remove();
@@ -214,7 +230,7 @@ class VoskService {
       this.isLoaded = false;
       this.isListening = false;
     } catch (e) {
-      console.error('Failed to unload Vosk model', e);
+      console.error('[SafeVoiceListening] Failed to unload Vosk model:', e);
     }
   }
 }
