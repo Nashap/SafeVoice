@@ -1,8 +1,8 @@
 import axios from 'axios';
 import { DeviceEventEmitter } from 'react-native';
 import * as Keychain from 'react-native-keychain';
-
-export const API_URL = 'http://10.0.2.2:8000/api';
+import { API_URL } from '../config/env';
+export { API_URL };
 
 const api = axios.create({
   baseURL: API_URL,

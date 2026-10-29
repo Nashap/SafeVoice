@@ -151,7 +151,9 @@ class SOSAlertTests(TestCase):
         # 1. Non-owner cannot upload audio (Account Isolation: 403 or 404)
         other_client = APIClient()
         other_client.force_authenticate(user=self.user4)
-        dummy_wav = SimpleUploadedFile("evidence.wav", b"RIFF....WAVEfmt ....data....", content_type="audio/wav")
+        # Valid minimal 44-byte PCM WAV header
+        valid_wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+        dummy_wav = SimpleUploadedFile("evidence.wav", valid_wav_bytes, content_type="audio/wav")
         resp_forbidden = other_client.post(audio_url, {'audio': dummy_wav, 'duration': 15.0}, format='multipart')
         self.assertIn(resp_forbidden.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
 
@@ -289,7 +291,8 @@ class SOSAlertTests(TestCase):
         mock_resp_success.status_code = 201
         mock_post.return_value = mock_resp_success
 
-        dummy_wav = SimpleUploadedFile("clip.wav", b"RIFF....WAVEfmt ....data....", content_type="audio/wav")
+        valid_wav_bytes = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+        dummy_wav = SimpleUploadedFile("clip.wav", valid_wav_bytes, content_type="audio/wav")
         resp = self.client.post(audio_url, {'audio': dummy_wav, 'duration': 15.0}, format='multipart')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(resp.data['status'], 'uploaded')
@@ -297,13 +300,20 @@ class SOSAlertTests(TestCase):
         self.assertEqual(resp.data['audio_bucket'], 'emergency-audio')
 
         # B) Mock failed Supabase upload (status 500) - must NEVER fall back or report success
+        history_fail = EmergencyHistory.objects.create(
+            user=self.user1,
+            trigger_type='voice',
+            score=95
+        )
+        audio_fail_url = reverse('history-audio', kwargs={'pk': history_fail.pk})
+
         mock_resp_fail = MagicMock()
         mock_resp_fail.status_code = 500
         mock_resp_fail.text = 'Internal Server Error on Supabase'
         mock_post.return_value = mock_resp_fail
 
         dummy_wav.seek(0)
-        resp_fail = self.client.post(audio_url, {'audio': dummy_wav, 'duration': 15.0}, format='multipart')
+        resp_fail = self.client.post(audio_fail_url, {'audio': dummy_wav, 'duration': 15.0}, format='multipart')
         self.assertEqual(resp_fail.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
         self.assertEqual(resp_fail.data['status'], 'failed')
         self.assertEqual(resp_fail.data['storage'], 'supabase')

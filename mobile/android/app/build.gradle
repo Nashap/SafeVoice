@@ -119,3 +119,7 @@ dependencies {
 }
 
 apply plugin: "com.google.gms.google-services"
+
+tasks.matching { it.name.startsWith("createBundle") }.configureEach {
+    doNotTrackState("Avoid OneDrive snapshotting issue on Windows")
+}

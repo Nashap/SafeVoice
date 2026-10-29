@@ -3,15 +3,57 @@ from firebase_admin import credentials, messaging
 from django.conf import settings
 
 def get_firebase_app():
+    """
+    Securely resolves and initializes the Firebase Admin SDK.
+    Supports:
+    1. FIREBASE_CREDENTIALS_JSON: Raw JSON string in environment variable (preferred for Render / cloud PaaS)
+    2. FIREBASE_CREDENTIALS_PATH: Path to mounted secret file (e.g. /etc/secrets/serviceAccountKey.json)
+    3. Local fallback path for development (if file exists)
+    Never logs private keys or credentials.
+    """
     if not firebase_admin._apps:
         import os
-        cred_path = os.environ.get('FIREBASE_CREDENTIALS_PATH', r'C:\SafeVoiceSecrets\serviceAccountKey.json')
-        try:
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred)
-        except Exception as e:
-            print(f"[FCM Init Error] Could not initialize Firebase Admin SDK. Check {cred_path}: {e}")
-            return None
+        import json
+
+        # 1. Production: Raw JSON string in environment variable (Render environment variable)
+        raw_json = os.environ.get('FIREBASE_CREDENTIALS_JSON', '').strip()
+        if raw_json:
+            try:
+                cert_dict = json.loads(raw_json)
+                cred = credentials.Certificate(cert_dict)
+                firebase_admin.initialize_app(cred)
+                print("[FCM] Firebase Admin SDK initialized successfully from FIREBASE_CREDENTIALS_JSON.")
+                return firebase_admin.get_app()
+            except Exception as e:
+                print(f"[FCM Init Error] Failed to initialize Firebase Admin SDK from FIREBASE_CREDENTIALS_JSON: {e}")
+                return None
+
+        # 2. Production/Staging: File path via environment variable (e.g. Render Secret File)
+        cred_path = os.environ.get('FIREBASE_CREDENTIALS_PATH', '').strip()
+        if cred_path and os.path.exists(cred_path):
+            try:
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred)
+                print(f"[FCM] Firebase Admin SDK initialized successfully from file: {cred_path}")
+                return firebase_admin.get_app()
+            except Exception as e:
+                print(f"[FCM Init Error] Failed to initialize Firebase Admin SDK from {cred_path}: {e}")
+                return None
+
+        # 3. Local Windows Development Fallback
+        default_local_path = r'C:\SafeVoiceSecrets\serviceAccountKey.json'
+        if os.path.exists(default_local_path):
+            try:
+                cred = credentials.Certificate(default_local_path)
+                firebase_admin.initialize_app(cred)
+                print(f"[FCM] Firebase Admin SDK initialized from default local path: {default_local_path}")
+                return firebase_admin.get_app()
+            except Exception as e:
+                print(f"[FCM Init Error] Could not initialize Firebase from default path: {e}")
+                return None
+
+        print("[FCM] Notice: Neither FIREBASE_CREDENTIALS_JSON nor valid FIREBASE_CREDENTIALS_PATH is configured. FCM push notifications will be skipped.")
+        return None
     return firebase_admin.get_app()
 
 def send_sos_fcm(user, emergency_history, is_contact=False, sender=None):

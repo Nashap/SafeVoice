@@ -11,3 +11,5 @@ firebase-admin==6.6.0
 
 djangorestframework-simplejwt==5.3.1
 requests==2.34.2
+gunicorn==26.0.0
+whitenoise==6.6.0
